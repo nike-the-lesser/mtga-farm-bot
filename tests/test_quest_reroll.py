@@ -438,7 +438,7 @@ class GameStartupTests(unittest.TestCase):
             g.start()
         c.start_game.assert_not_called()
 
-    def test_failed_reroll_does_not_start_queueing_without_dialog(self):
+    def test_deferred_reroll_allows_startup_to_continue(self):
         from Game import Game
         c = Mock()
         c._stop_requested = False
@@ -454,7 +454,7 @@ class GameStartupTests(unittest.TestCase):
                 patch("Game.CardInfo.warm_up_starter_data"), \
                 patch("Game.CardInfo.refresh_missing_cards"):
             g.start()
-        c.start_game.assert_not_called()
+        c.start_game.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -145,7 +145,11 @@ class Game:
                 # Do not launch the queue loop behind it; clicking Play beneath
                 # a modal is both unsafe and creates the apparent "retrying"
                 # startup stall that prompted this guard.
-                if not self.controller.reroll_quest_on_landing():
+                # A false result can be a safe deferral while a match or account
+                # switch owns the UI. Only an unresolved swap dialog blocks the
+                # first queue attempt.
+                if (not self.controller.reroll_quest_on_landing()
+                        and getattr(self.controller, "_quest_reroll_dialog_open", False)):
                     runtime_status.set_startup_phase("Quest reroll needs attention")
                     self._debug("Startup paused: quest reroll dialog is unresolved.")
                     return
