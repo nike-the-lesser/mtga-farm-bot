@@ -354,6 +354,8 @@ class VisionGuardTests(RerollCase):
         c._reroll_match = Mock(side_effect=[None, (540, 900), (830, 900)])
         self.assertEqual(Controller._find_500_gold_quest_tile(c), (540, 900))
         self.assertEqual([call.args[1][0] for call in c._reroll_match.call_args_list], [150, 450])
+        self.assertTrue(all(call.kwargs["confidence"] == 0.82
+                            for call in c._reroll_match.call_args_list))
 
     @unittest.skipIf(cv2 is None, "OpenCV not installed")
     def test_dimmed_control_is_rejected_despite_template_match(self):

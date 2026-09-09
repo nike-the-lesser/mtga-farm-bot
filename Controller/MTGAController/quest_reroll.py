@@ -247,14 +247,14 @@ class QuestRerollMixin:
             time.sleep(0.2)
         return None
 
-    def _reroll_match(self, name, region, *, timeout=1.0):
+    def _reroll_match(self, name, region, *, confidence=0.94, timeout=1.0):
         if cv2 is None:
             return None
         path = (self._app_path("assets", "assert", "home_anchor.png") if name == "home"
                 else self._app_path("assets", "assert", "quest_reroll", name + ".png"))
         point = self._locate_image_center_in_scaled_arena_region(
             path, "QUEST_REROLL_" + name.upper(), rel_region=region,
-            confidence=0.94, timeout=timeout, use_direct=False,
+            confidence=confidence, timeout=timeout, use_direct=False,
         )
         if point is None or not self._reroll_can_act():
             return None
@@ -287,7 +287,10 @@ class QuestRerollMixin:
         # 1920x1080 frame. Each band contains one daily quest; daily/weekly win
         # rewards begin to the RIGHT of these three bands and are excluded.
         for x in (150, 450, 750):
-            point = self._reroll_match("gold_500", (x, 750, 300, 210))
+            # The reward emblem is small and has changed slightly between Arena
+            # client releases. Keep this tolerant match within only the three
+            # daily-quest bands; the brightness guard still rejects dimmed UI.
+            point = self._reroll_match("gold_500", (x, 750, 300, 210), confidence=0.82)
             if point is not None:
                 return point
         return None
