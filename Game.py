@@ -140,8 +140,22 @@ class Game:
                 self.controller.prime_quests_for_new_session()
             elif hasattr(self.controller, "refresh_quests_cache"):
                 self.controller.refresh_quests_cache()
+            if hasattr(self.controller, "reroll_quest_on_landing"):
+                # A visible but unresolved Confirm Swap dialog owns the screen.
+                # Do not launch the queue loop behind it; clicking Play beneath
+                # a modal is both unsafe and creates the apparent "retrying"
+                # startup stall that prompted this guard.
+                if not self.controller.reroll_quest_on_landing():
+                    runtime_status.set_startup_phase("Quest reroll needs attention")
+                    self._debug("Startup paused: quest reroll dialog is unresolved.")
+                    return
         except Exception as e:
             self._debug(f"Quest cache refresh failed: {e}")
+        # Stop can arrive during the bounded quest read/reroll. start_game()
+        # begins a session and clears the controller's stop flag, so do not call
+        # it after the user has cancelled startup.
+        if self._stop_requested or getattr(self.controller, "_stop_requested", False) is True:
+            return
         self.controller.start_game()
         self.controller.set_mulligan_decision_callback(self.mulligan_decision_method)
         self.controller.set_decision_callback(self.decision_method)
