@@ -96,6 +96,16 @@ class SnapshotTests(RerollCase):
         self.append([], canSwap=True)
         self.assertIsNone(self.c._extract_latest_quest_snapshot(min_offset=self.c._quest_reroll_floor))
 
+    def test_log_rotation_drops_stale_ordinary_reroll_floor(self):
+        self.c._quest_reroll_data_floor = 10_000
+        self.append([quest("new")], canSwap=True)
+
+        snapshot = self.c._extract_latest_quest_snapshot()
+
+        self.assertIsNotNone(snapshot)
+        self.assertIsNone(self.c._quest_reroll_data_floor)
+        self.assertEqual(snapshot["quests"][0]["questId"], "new")
+
 
 class EligibilityTests(unittest.TestCase):
     def test_only_known_incomplete_500_gold_quests(self):
@@ -387,6 +397,7 @@ class GameStartupTests(unittest.TestCase):
             with self.subTest(stop=stop):
                 c = Mock()
                 c._stop_requested = False
+                c._quest_reroll_dialog_open = False
                 order = []
                 c.prime_quests_for_new_session.side_effect = lambda: order.append("prime")
                 def reroll():
@@ -410,6 +421,7 @@ class GameStartupTests(unittest.TestCase):
         from Game import Game
         c = Mock()
         c._stop_requested = False
+        c._quest_reroll_dialog_open = True
         c.reroll_quest_on_landing.return_value = False
         g = Game(c, Mock())
         g._refresh_card_data = Mock()
@@ -422,6 +434,24 @@ class GameStartupTests(unittest.TestCase):
                 patch("Game.CardInfo.refresh_missing_cards"):
             g.start()
         c.start_game.assert_not_called()
+
+    def test_deferred_reroll_allows_startup_to_continue(self):
+        from Game import Game
+        c = Mock()
+        c._stop_requested = False
+        c._quest_reroll_dialog_open = False
+        c.reroll_quest_on_landing.return_value = False
+        g = Game(c, Mock())
+        g._refresh_card_data = Mock()
+        g._debug = Mock()
+        with patch("Game.debug_recorder.start_session"), \
+                patch("Game.click_recorder.start_session"), \
+                patch("Game.runtime_status.set_mode"), \
+                patch("Game.runtime_status.set_startup_phase"), \
+                patch("Game.CardInfo.warm_up_starter_data"), \
+                patch("Game.CardInfo.refresh_missing_cards"):
+            g.start()
+        c.start_game.assert_called_once()
 
 
 if __name__ == "__main__":

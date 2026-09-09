@@ -2432,6 +2432,14 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         # -- i.e. the new account would start on the old account's quests.
         # Assume not-fresh; only a block provably past the boundary flips this.
         self._last_quests_read_was_fresh = False
+        if (min_offset is None and self._quest_reroll_data_floor is not None
+                and self._get_log_size(self._log_path) < self._quest_reroll_data_floor):
+            # MTGA rotates Player.log on restart. A shorter file is a new log,
+            # so keeping the old ordinary-read floor would freeze quest reads.
+            bot_logger.log_info(
+                "Quest read: log shrank below the reroll floor; dropping the boundary."
+            )
+            self._quest_reroll_data_floor = None
         if min_offset is not None or self._quest_reroll_data_floor is not None:
             floor = max(min_offset or 0, self._quest_reroll_data_floor or 0,
                         self._quest_reroll_floor if min_offset is not None else 0)
@@ -8436,9 +8444,16 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         # each log out the next account when the previous request finished.
         try:
             with self._home_navigation_lock:
-                if self._quest_reroll_dialog_open and not self._close_quest_reroll_dialog():
-                    self._release_switch_ownership()
-                    self._resume_queue_if_idle()
+                try:
+                    dialog_clear = (not self._quest_reroll_dialog_open
+                                    or self._close_quest_reroll_dialog())
+                except Exception as exc:
+                    bot_logger.log_error(f"Quest reroll dialog close failed: {exc}")
+                    dialog_clear = False
+                if not dialog_clear:
+                    # Counts the attempt and restarts the queue loop, so a dialog
+                    # we cannot close stops being retried forever.
+                    self._abort_switch_and_resume("quest reroll dialog still open")
                     return
                 self._perform_owned_account_switch()
         finally:

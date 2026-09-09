@@ -13,7 +13,9 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 # Keep this diagnostic separate from a real bot session, including its status.
-os.environ.setdefault("MTGA_RUNTIME_DIR", str(ROOT / "runtime" / "quest-reroll-validation"))
+runtime_parent = (os.environ.get("MTGA_RUNTIME_DIR") or "").strip()
+runtime_parent = Path(runtime_parent).expanduser() if runtime_parent else ROOT / "runtime"
+os.environ["MTGA_RUNTIME_DIR"] = str(runtime_parent / "quest-reroll-validation")
 
 from Controller.MTGAController.Controller import Controller
 from Controller.MTGAController.quest_reroll import is_eligible
