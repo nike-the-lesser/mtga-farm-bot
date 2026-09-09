@@ -120,7 +120,10 @@ class QuestRerollMixin:
             point = self._find_500_gold_quest_tile()
             if point is None:
                 self._reroll_log("failed", "500-gold quest tile not recognized")
-                return True
+                # The log says a rerollable 500-gold quest exists, but the UI
+                # could not identify it. Do not launch the queue underneath an
+                # unresolved startup reroll.
+                return False
             if not self._reroll_can_act():
                 return False
             # Mark uncertain before the click: even a click exception can leave

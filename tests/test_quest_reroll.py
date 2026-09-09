@@ -237,11 +237,11 @@ class LandingTests(RerollCase):
         self.assertEqual(self.tags(), ["QUEST_REROLL_REFRESH_PROFILE"])
 
     def test_failed_recognition_and_unavailable_confirmation(self):
-        for attr, value, expected in (
-            ("_quest_reroll_templates_ready", False, []),
-            ("_find_500_gold_quest_tile", None, []),
-            ("_quest_reroll_dialog_visible", False, ["QUEST_REROLL_OPEN"]),
-            ("_quest_reroll_confirm_point", None, ["QUEST_REROLL_OPEN"]),
+        for attr, value, expected, may_proceed in (
+            ("_quest_reroll_templates_ready", False, [], True),
+            ("_find_500_gold_quest_tile", None, [], False),
+            ("_quest_reroll_dialog_visible", False, ["QUEST_REROLL_OPEN"], True),
+            ("_quest_reroll_confirm_point", None, ["QUEST_REROLL_OPEN"], True),
         ):
             with self.subTest(attr=attr):
                 self.c._quest_reroll_dialog_open = False
@@ -249,8 +249,9 @@ class LandingTests(RerollCase):
                 self.c._click_abs.reset_mock()
                 self.append(canSwap=True)
                 with patch.object(self.c, attr, return_value=value):
-                    self.c.reroll_quest_on_landing()
+                    result = self.c.reroll_quest_on_landing()
                 self.assertEqual(self.tags(), expected)
+                self.assertEqual(result, may_proceed)
 
     def test_stop_before_confirmation_never_submits(self):
         self.append(canSwap=True)
@@ -435,7 +436,7 @@ class GameStartupTests(unittest.TestCase):
             g.start()
         c.start_game.assert_not_called()
 
-    def test_deferred_reroll_allows_startup_to_continue(self):
+    def test_failed_reroll_does_not_start_queueing_without_dialog(self):
         from Game import Game
         c = Mock()
         c._stop_requested = False
@@ -451,7 +452,7 @@ class GameStartupTests(unittest.TestCase):
                 patch("Game.CardInfo.warm_up_starter_data"), \
                 patch("Game.CardInfo.refresh_missing_cards"):
             g.start()
-        c.start_game.assert_called_once()
+        c.start_game.assert_not_called()
 
 
 if __name__ == "__main__":
