@@ -4973,7 +4973,22 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         if self._stop_requested:
             return False
         if not self.reroll_quest_on_landing():
-            return False
+            # This routine runs ONCE per login/switch (_post_login_action_done),
+            # so returning False here drops the account's deck selection for good
+            # -- it then queues with whatever deck the previous account left
+            # selected. Only give up when the screen is genuinely not ours: an
+            # unresolved swap dialog, a stop, or a match/foreign switch owning
+            # the UI. Every other reroll failure (Home not verified, tile not
+            # recognized) is self-healing, and the deck routine navigates to Home
+            # itself, so continue.
+            if (self._quest_reroll_dialog_open or self._stop_requested
+                    or not self._reroll_can_act()
+                    or (self._account_switch_in_progress
+                        and self._switch_owner_ident != threading.get_ident())):
+                return False
+            bot_logger.log_info(
+                "Post-login: quest reroll did not run; continuing with deck selection."
+            )
         if self._game_mode == "starter":
             return self._run_starter_deck_routine()
         quest = self._select_best_quest()

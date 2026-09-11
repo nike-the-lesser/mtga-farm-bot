@@ -81,13 +81,37 @@ class QuestRerollMixin:
         A match defers the one-shot. A failed/uncertain submission consumes it.
         A dialog whose closure cannot be verified blocks queue clicks until a
         subsequent landing check can close it (without submitting again).
+
+        Nothing may escape from here: the queue loop calls this without its own
+        exception handling, so a raising screen probe would end that thread.
         """
+        try:
+            return self._reroll_quest_on_landing_locked()
+        except Exception as exc:
+            # Covers the pre-checks and the retry branch below, which run
+            # outside the submission try. Block navigation while a dialog may
+            # still own the screen; otherwise let normal Home traffic continue.
+            # Mirrors every guard of the normal path, so a raising screen probe
+            # cannot be the one thing that lets a caller past them.
+            self._reroll_log("failed", f"landing check: {exc}")
+            return not (getattr(self, "_quest_reroll_dialog_open", True)
+                        or self._stop_requested
+                        or (self._account_switch_in_progress
+                            and self._switch_owner_ident != threading.get_ident()))
+
+    def _reroll_quest_on_landing_locked(self):
         if not self._reroll_can_act():
             return False
         if self._account_switch_in_progress and self._switch_owner_ident != threading.get_ident():
             return False
         if self._quest_reroll_dialog_open:
-            return self._close_quest_reroll_dialog()
+            try:
+                return self._close_quest_reroll_dialog()
+            except Exception as exc:
+                # Keep the flag set: the next safe Home landing must retry the
+                # cleanup, rather than allowing a queue click beneath a modal.
+                self._reroll_log("failed", f"dialog cleanup: {exc}")
+                return False
         if not self._quest_reroll_pending:
             return True
         self._quest_reroll_pending = False
@@ -120,9 +144,13 @@ class QuestRerollMixin:
             point = self._find_500_gold_quest_tile()
             if point is None:
                 self._reroll_log("failed", "500-gold quest tile not recognized")
-                # The log says a rerollable 500-gold quest exists, but the UI
-                # could not identify it. Do not launch the queue underneath an
-                # unresolved startup reroll.
+                # A non-matching tile is safe to skip only when Home still owns
+                # the UI after the search. Otherwise retain the one-shot so a
+                # later queue tick cannot pass an uncertain/overlaid screen.
+                if self._quest_reroll_home_visible():
+                    self._reroll_log("skipped", "500-gold quest tile not recognized; Home rechecked")
+                    return True
+                self._quest_reroll_pending = True
                 return False
             if not self._reroll_can_act():
                 return False

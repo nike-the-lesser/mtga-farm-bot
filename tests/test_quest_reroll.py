@@ -239,7 +239,6 @@ class LandingTests(RerollCase):
     def test_failed_recognition_and_unavailable_confirmation(self):
         for attr, value, expected, may_proceed in (
             ("_quest_reroll_templates_ready", False, [], True),
-            ("_find_500_gold_quest_tile", None, [], False),
             ("_quest_reroll_dialog_visible", False, ["QUEST_REROLL_OPEN"], True),
             ("_quest_reroll_confirm_point", None, ["QUEST_REROLL_OPEN"], True),
         ):
@@ -252,6 +251,69 @@ class LandingTests(RerollCase):
                     result = self.c.reroll_quest_on_landing()
                 self.assertEqual(self.tags(), expected)
                 self.assertEqual(result, may_proceed)
+
+    def test_unrecognized_tile_continues_historic_deck_selection_after_home_recheck(self):
+        """A visual miss must not skip the post-login Historic deck path on Home."""
+        c = self.c
+        c._arm_quest_reroll()
+        self.append(canSwap=True)
+        c._find_500_gold_quest_tile.return_value = None
+        c._run_post_login_navigation_oob = Mock(return_value=True)
+        c._select_best_quest = Mock(return_value=None)
+        c._choose_deck_image = Mock(return_value="historic-deck.png")
+        c._click_image = Mock(return_value=True)
+
+        self.assertTrue(c._run_post_login_routine({"name": "incoming"}, []))
+
+        self.assertEqual(c._quest_reroll_home_visible.call_count, 2)
+        c._run_post_login_navigation_oob.assert_called_once()
+        c._choose_deck_image.assert_called_once_with({"name": "incoming"}, "", None)
+        self.assertEqual(
+            [call.args[1] for call in c._click_image.call_args_list],
+            ["POST_LOGIN_DECK", "POST_LOGIN_PLAY_CONFIRM"],
+        )
+
+    def test_unrecognized_tile_keeps_reroll_pending_until_home_is_rechecked(self):
+        c = self.c
+        c._arm_quest_reroll()
+        self.append(canSwap=True)
+        c._find_500_gold_quest_tile.return_value = None
+        c._quest_reroll_home_visible.side_effect = [True, False, True, True]
+
+        self.assertFalse(c.reroll_quest_on_landing())
+        self.assertTrue(c._quest_reroll_pending)
+        self.assertTrue(c.reroll_quest_on_landing())
+        self.assertFalse(c._quest_reroll_pending)
+
+    def test_dialog_cleanup_exception_keeps_flag_and_next_landing_resumes(self):
+        c = self.c
+        c._quest_reroll_dialog_open = True
+        c._quest_reroll_pending = False
+
+        attempts = []
+
+        def close(*_args):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("temporary vision error")
+            c._quest_reroll_dialog_open = False
+            return True
+
+        c._close_quest_reroll_dialog.side_effect = close
+        self.assertFalse(c.reroll_quest_on_landing())
+        self.assertTrue(c._quest_reroll_dialog_open)
+
+        c._run_post_login_navigation_oob = Mock(return_value=True)
+        c._select_best_quest = Mock(return_value=None)
+        c._choose_deck_image = Mock(return_value="historic-deck.png")
+        c._click_image = Mock(return_value=True)
+        self.assertTrue(c._run_post_login_routine({"name": "incoming"}, []))
+        self.assertFalse(c._quest_reroll_dialog_open)
+        self.assertEqual(c._close_quest_reroll_dialog.call_count, 2)
+        self.assertEqual(
+            [call.args[1] for call in c._click_image.call_args_list],
+            ["POST_LOGIN_DECK", "POST_LOGIN_PLAY_CONFIRM"],
+        )
 
     def test_stop_before_confirmation_never_submits(self):
         self.append(canSwap=True)
@@ -301,6 +363,36 @@ class LandingTests(RerollCase):
         c._navigate_starter_deck.assert_not_called()
         c._select_best_quest.assert_not_called()
         c._click_abs.assert_not_called()
+
+    def test_recoverable_reroll_failure_still_selects_a_deck(self):
+        # The post-login routine runs once per login/switch, so a self-healing
+        # reroll failure must not cost the account its deck selection.
+        c = self.c
+        c._game_mode = "starter"
+        c._run_starter_deck_routine = Mock(return_value=True)
+        c.reroll_quest_on_landing = Mock(return_value=False)
+        self.assertTrue(c._run_post_login_routine({}, []))
+        c._run_starter_deck_routine.assert_called_once()
+
+    def test_match_or_stop_still_skips_deck_selection(self):
+        c = self.c
+        c._game_mode = "starter"
+        c._run_starter_deck_routine = Mock(return_value=True)
+        c.reroll_quest_on_landing = Mock(return_value=False)
+        c._get_state_from_log.return_value = BotState.IN_GAME
+        self.assertFalse(c._run_post_login_routine({}, []))
+        c._run_starter_deck_routine.assert_not_called()
+
+    def test_raising_screen_probe_cannot_kill_the_queue_thread(self):
+        c = self.c
+        c._get_state_from_log.side_effect = OSError("screen gone")
+        self.assertTrue(c.reroll_quest_on_landing())
+        c._quest_reroll_dialog_open = True
+        self.assertFalse(c.reroll_quest_on_landing())
+        c._get_state_from_log.side_effect = None
+        c._close_quest_reroll_dialog.side_effect = OSError("capture failed")
+        self.assertFalse(c.reroll_quest_on_landing())
+        self.assertTrue(c._quest_reroll_dialog_open)
 
     def test_post_login_check_precedes_deck_selection(self):
         c = self.c
