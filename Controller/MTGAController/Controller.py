@@ -16,6 +16,9 @@ import AI.Utilities.CounterLogic as CounterLogic
 import AI.Utilities.CardInfo as CardInfo
 import AI.Utilities.LifegainLogic as LifegainLogic
 from Controller.MTGAController.LogReader import LogReader
+from Controller.MTGAController.quest_reroll import (
+    QuestRerollMixin, replacement_verified, serialized_home_navigation,
+)
 from Controller.Utilities.GameState import GameState
 from Controller.Utilities.input_controller import InputControllerError, create_input_controller
 from actions.actions import run_action
@@ -61,7 +64,7 @@ _MY_TIMER_TYPES = {
 }
 
 
-class Controller(ControllerSecondary):
+class Controller(QuestRerollMixin, ControllerSecondary):
 
     # MTGA holds up to 3 daily quests; completed ones drop out of the list. Used
     # to derive absolute completions (slots - remaining) for the switch decision.
@@ -719,6 +722,8 @@ class Controller(ControllerSecondary):
         # queue loop start into a switch that had just begun. Neither holds the lock
         # while calling the other, so there is no lock-order cycle here.
         self._switch_start_lock = threading.Lock()
+        self._home_navigation_lock = threading.RLock()
+        self._arm_quest_reroll()
         self._queue_after_login = False
         self._queue_spam_thread = None
         self._stop_queue_spam = False
@@ -2393,13 +2398,25 @@ class Controller(ControllerSecondary):
         return '"quests"' in (window or "")
 
     def _extract_latest_quests(self) -> list[dict] | None:
-        """Latest quests block from the log, or None when none is available.
+        """Compatibility view of the shared quest response parser."""
+        snapshot = self._extract_latest_quest_snapshot()
+        if snapshot is None:
+            return None
+        before = self._quest_reroll_unverified_before
+        if before is not None:
+            if not replacement_verified(before, snapshot):
+                return None
+            self._quest_reroll_unverified_before = None
+        return snapshot["quests"]
+
+    def _extract_latest_quest_snapshot(self, *, min_offset: int | None = None) -> dict | None:
+        """Latest {quests, canSwap} response, or None when none is available.
 
         Returns None for "no readable/valid block" (no log, no block, parse error,
         or a stale block from a previous account) so callers keep their cache.
-        Returns a list (possibly EMPTY) when a current block exists -- an empty
-        list means all daily quests are completed, which the quest-mode account
-        switch must be able to see."""
+        A response may contain an empty quest list. min_offset requests a strict
+        read past a startup/login/confirmation boundary, with no stale fallback.
+        The legacy list-only method shares this parser."""
         if not self._log_path:
             return None
         # While we have not yet latched the incoming account's screenName after a
@@ -2415,7 +2432,23 @@ class Controller(ControllerSecondary):
         # -- i.e. the new account would start on the old account's quests.
         # Assume not-fresh; only a block provably past the boundary flips this.
         self._last_quests_read_was_fresh = False
-        if self._quests_valid_from_offset > 0 and (
+        if (min_offset is None and self._quest_reroll_data_floor is not None
+                and self._get_log_size(self._log_path) < self._quest_reroll_data_floor):
+            # MTGA rotates Player.log on restart. A shorter file is a new log,
+            # so keeping the old ordinary-read floor would freeze quest reads.
+            bot_logger.log_info(
+                "Quest read: log shrank below the reroll floor; dropping the boundary."
+            )
+            self._quest_reroll_data_floor = None
+        if min_offset is not None or self._quest_reroll_data_floor is not None:
+            floor = max(min_offset or 0, self._quest_reroll_data_floor or 0,
+                        self._quest_reroll_floor if min_offset is not None else 0)
+            log_tail = self._read_log_since(
+                self._log_path, start_offset=floor,
+                max_bytes=2_000_000, prefer_newest=True,
+            )
+            self._last_quests_read_was_fresh = True
+        elif self._quests_valid_from_offset > 0 and (
             self._current_account_screen_name is None or self._identity_from_config
         ):
             log_tail = self._read_log_since(
@@ -2465,8 +2498,10 @@ class Controller(ControllerSecondary):
             payload, end = decoder.raw_decode(log_tail[start:])
         except Exception:
             return None
-        quests = payload.get("quests", [])
-        if not isinstance(quests, list):
+        if not isinstance(payload, dict):
+            return None
+        quests = payload.get("quests")
+        if not isinstance(quests, list) or not all(isinstance(q, dict) for q in quests):
             return None
         # Latch the current account's own screenName. The QuestGetQuests response
         # carries NO account identity, and match events log BOTH players' names
@@ -2476,7 +2511,12 @@ class Controller(ControllerSecondary):
         # already handled by the offset gate above, so we just latch/refresh the
         # identity here for gold attribution and round tracking.
         self._latch_account_screen_name_from(log_tail)
-        return quests
+        # Arena's serializer omits false/default fields. Observed after a real
+        # swap: both top-level and per-quest canSwap disappear. An omitted flag
+        # is unavailable; malformed explicit values remain unknown. Only a
+        # literal true response can ever authorize clicking a quest.
+        can_swap = payload.get("canSwap", False)
+        return {"quests": quests, "canSwap": can_swap if type(can_swap) is bool else None}
 
     @staticmethod
     def _canonical_screen_name(screen: str | None) -> str:
@@ -3466,6 +3506,7 @@ class Controller(ControllerSecondary):
         # bar keeps saying "Loading card data" for that whole wait, which reads as
         # a hung card import.
         runtime_status.set_startup_phase("Reading daily quests")
+        self._arm_quest_reroll()
         self._reset_quest_cache_for_new_session()
         if not self._log_path:
             return False
@@ -4988,9 +5029,27 @@ class Controller(ControllerSecondary):
             self._click_starter_back_arrow()
             time.sleep(1.5)
 
+    @serialized_home_navigation
     def _run_post_login_routine(self, account: dict, all_accounts: list[dict]) -> bool:
         if self._stop_requested:
             return False
+        if not self.reroll_quest_on_landing():
+            # This routine runs ONCE per login/switch (_post_login_action_done),
+            # so returning False here drops the account's deck selection for good
+            # -- it then queues with whatever deck the previous account left
+            # selected. Only give up when the screen is genuinely not ours: an
+            # unresolved swap dialog, a stop, or a match/foreign switch owning
+            # the UI. Every other reroll failure (Home not verified, tile not
+            # recognized) is self-healing, and the deck routine navigates to Home
+            # itself, so continue.
+            if (self._quest_reroll_dialog_open or self._stop_requested
+                    or not self._reroll_can_act()
+                    or (self._account_switch_in_progress
+                        and self._switch_owner_ident != threading.get_ident())):
+                return False
+            bot_logger.log_info(
+                "Post-login: quest reroll did not run; continuing with deck selection."
+            )
         if self._game_mode == "starter":
             return self._run_starter_deck_routine()
         quest = self._select_best_quest()
@@ -5120,7 +5179,10 @@ class Controller(ControllerSecondary):
         bot_logger.log_info(f"Post-login: deck selected ({os.path.basename(selected_deck)}) and play clicked.")
         return True
 
+    @serialized_home_navigation
     def start_game_from_home_screen(self):
+        if not self.reroll_quest_on_landing():
+            return
         # Quests-mode switch decision must reflect THIS account's real quest state
         # on landing (done by bot or human), not a stale/empty cache. Before the
         # first queue for each account, read its quests from Home once. If the
@@ -8321,6 +8383,7 @@ class Controller(ControllerSecondary):
         identity dropped, while its switch criteria stayed met, so the bot would
         retry the same failing switch indefinitely."""
         # Quest-mode tracking: the incoming account restarts its daily-win count.
+        self._arm_quest_reroll()
         self._daily_wins_this_account = 0
         self._win_counted_this_match = False
         # Re-evaluate the incoming account's quest state fresh from its own Home:
@@ -8452,6 +8515,27 @@ class Controller(ControllerSecondary):
                 return
             self._account_switch_in_progress = True
             self._switch_owner_ident = threading.get_ident()
+        # Claim the existing switch slot BEFORE waiting for Home navigation.
+        # Otherwise duplicate switch requests would queue on the UI lock and
+        # each log out the next account when the previous request finished.
+        try:
+            with self._home_navigation_lock:
+                try:
+                    dialog_clear = (not self._quest_reroll_dialog_open
+                                    or self._close_quest_reroll_dialog())
+                except Exception as exc:
+                    bot_logger.log_error(f"Quest reroll dialog close failed: {exc}")
+                    dialog_clear = False
+                if not dialog_clear:
+                    # Counts the attempt and restarts the queue loop, so a dialog
+                    # we cannot close stops being retried forever.
+                    self._abort_switch_and_resume("quest reroll dialog still open")
+                    return
+                self._perform_owned_account_switch()
+        finally:
+            self._release_switch_ownership()
+
+    def _perform_owned_account_switch(self) -> None:
         # Never act while a match is running or starting. The post-match flow and
         # the queue loop can both fire this, and they race with the queue click:
         # observed live, the loop clicked Play and ~1s later a queue-ready marker
