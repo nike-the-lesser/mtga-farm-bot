@@ -516,6 +516,10 @@ class AccountDisplayIdentityTests(unittest.TestCase):
         configured = [{"name": "First", "screen_name": "Player#11111"}]
         self.assertEqual(self._resolve("Player", configured), "First")
 
+    def test_different_full_discriminator_does_not_use_unique_base_fallback(self):
+        configured = [{"name": "First", "screen_name": "Player#11111"}]
+        self.assertEqual(self._resolve("Player#22222", configured), "Player#22222")
+
 
 class AliasNamespaceTests(unittest.TestCase):
     """Full identities stay distinct while safe legacy spellings still resolve."""
@@ -621,6 +625,21 @@ class AliasNamespaceTests(unittest.TestCase):
 
         self.assertEqual(c._current_account_config_name("Player"), "Player#11111")
         self.assertTrue(c._same_account("Player", "Player#11111"))
+
+    def test_different_full_discriminator_is_not_the_configured_account(self):
+        c = make_controller()
+        c._load_accounts_from_dirs = lambda: [
+            {"name": "Player#11111", "screen_name": "Player#11111"}
+        ]
+        c._screenname_to_alias = {}
+        c._seed_aliases_from_account_configs()
+
+        self.assertIsNone(c._current_account_config_name("Player#22222"))
+        self.assertFalse(c._same_account("Player#11111", "Player#22222"))
+        self.assertNotEqual(
+            c._account_identity_key("Player#11111"),
+            c._account_identity_key("Player#22222"),
+        )
 
     def test_ambiguous_base_name_is_never_guessed(self):
         c = make_controller()

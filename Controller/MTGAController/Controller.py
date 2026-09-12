@@ -2568,6 +2568,11 @@ class Controller(QuestRerollMixin, ControllerSecondary):
             for key, alias in self._screenname_to_alias.items():
                 if self._canonical_screen_name(key).casefold() == exact_key and alias:
                     return str(alias)
+        # A supplied discriminator is authoritative. Falling back by visible name
+        # here would make an unknown ``Player#22222`` resolve as the configured
+        # ``Player#11111`` merely because it is the only Player row.
+        if "#" in exact:
+            return None
         if self._screen_name_base_is_ambiguous(exact):
             return None
         base_key = self._screen_name_base(exact).casefold()
@@ -3159,8 +3164,9 @@ class Controller(QuestRerollMixin, ControllerSecondary):
             if configured.casefold() == query_key or name.casefold() == query_key:
                 return name or None
         # Compatibility for old rows that omitted #digits, but only when the base
-        # identifies exactly one configured account.
-        if len(matches) == 1:
+        # identifies exactly one configured account. A different full discriminator
+        # is positive evidence that this is not the configured account.
+        if "#" not in query and len(matches) == 1:
             return str(matches[0].get("name", "")).strip() or None
         return None
 
