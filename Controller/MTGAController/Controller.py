@@ -8305,6 +8305,8 @@ class Controller(QuestRerollMixin, ControllerSecondary):
 
     def __has_pending_mulligan_state(self, raw_dict: dict | None = None) -> bool:
         try:
+            if getattr(self, "_Controller__has_mulled_keep", False):
+                return False
             if raw_dict is not None and self.__has_local_mulligan_request(raw_dict):
                 return True
             turn_info = self.updated_game_state.get_turn_info() or {}
@@ -8736,12 +8738,21 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                 step=self.battlefield_scan_step,
                 clicks=clicks,
                 label="OPP_BATTLEFIELD_ITEM",
-                max_scan_sec=4.0,
+                max_scan_sec=6.0,
             ):
                 return True
             bot_logger.log_error(
                 f"Opponent battlefield select failed for card_id={card_id} "
                 f"(scan {scan_p1}->{scan_p2}); region may need calibration."
+            )
+            current_pos = self.input.position()
+            self._write_hand_select_debug_bundle(
+                reason="opponent_battlefield_select_failed",
+                card_id=card_id,
+                scan_start=scan_p1,
+                scan_end=scan_p2,
+                current_pos=(current_pos.x, current_pos.y),
+                current_hovered_id=None,
             )
             return False
         finally:
@@ -8966,6 +8977,8 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         y_min, y_max = (y1, y2) if y1 <= y2 else (y2, y1)
         step = max(10, int(step))
         start_ts = time.time()
+        hover_count = 0
+        last_hovered_id = None
 
         reset_x = x_min
         reset_y = max(self.screen_bounds[0][1], y_min - 80)
@@ -8980,7 +8993,9 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     return False
                 if max_scan_sec is not None and (time.time() - start_ts) > max_scan_sec:
                     bot_logger.log_error(
-                        f"{label}_TIMEOUT: card {card_id} not found within {max_scan_sec:.1f}s"
+                        f"{label}_TIMEOUT: card {card_id} not found within {max_scan_sec:.1f}s "
+                        f"at=({x},{y}) bounds={p1}->{p2} step={step} "
+                        f"hovers={hover_count} last_hover={last_hovered_id}"
                     )
                     return False
                 self.log_reader.clear_new_line_flag(self.patterns['hover_id'])
@@ -8993,6 +9008,8 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                 )
                 if parsed is None:
                     continue
+                hover_count += 1
+                last_hovered_id = parsed
                 bot_logger.log_hover(parsed)
                 if parsed != card_id:
                     continue
@@ -9006,7 +9023,10 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     time.sleep(0.1)
                 return True
 
-        bot_logger.log_error(f"{label}_FAILED: Card {card_id} not found in scan region")
+        bot_logger.log_error(
+            f"{label}_FAILED: Card {card_id} not found in scan region "
+            f"bounds={p1}->{p2} step={step} hovers={hover_count} last_hover={last_hovered_id}"
+        )
         return False
 
     def unconditional_auto_pass(self) -> None:
@@ -9450,6 +9470,12 @@ class Controller(QuestRerollMixin, ControllerSecondary):
             return None
         turn = self.updated_game_state.get_turn_info() or {}
         my_seat = self.__system_seat_id
+        # A delayed opponent decision can leave our old prompt state in the
+        # merged GameState. Explicit opponent priority rules out a local stall.
+        priority_seat = turn.get("priorityPlayer")
+        if (my_seat is not None and priority_seat is not None
+                and priority_seat != my_seat):
+            return None
         local_priority = my_seat is not None and turn.get("decisionPlayer") == my_seat
         prompt_kind = None
         if self.__has_pending_mulligan_state():
@@ -9676,7 +9702,15 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                         1.0,
                     )
                 return
-        bot_logger.log_info(f"STALL_WATCHDOG_TRIGGERED: age={age:.1f}s reason=stalled_local_context")
+        turn = self.updated_game_state.get_turn_info() or {}
+        bot_logger.log_info(
+            "STALL_WATCHDOG_TRIGGERED: age={:.1f}s reason=stalled_local_context "
+            "mySeat={} decisionPlayer={} priorityPlayer={} phase={} step={} prompt={}".format(
+                age, self.__system_seat_id, turn.get("decisionPlayer"),
+                turn.get("priorityPlayer"), turn.get("phase"), turn.get("step"),
+                trigger_signature[0] if trigger_signature else None,
+            )
+        )
         self.__cancel_pending_decisions_for_concede()
         self.__run_claimed_concede_sequence("STALL_CONCEDE", trigger_signature, expected_match_id)
 

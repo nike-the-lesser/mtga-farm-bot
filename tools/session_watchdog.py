@@ -62,6 +62,14 @@ from tools.incident_tracking import (
 # cooldown throttles alerts.log writes only -- per-match counting still counts
 # every occurrence.
 ALERT_SIGNATURES: tuple[tuple[str, tuple[str, ...], float], ...] = (
+    # TEMPORARY SOAK (2026-09): remove these six signatures after the overnight
+    # concede / quest / creature-target investigation is complete.
+    ("stall_concede", ("STALL_WATCHDOG_TRIGGERED",), 0.0),
+    ("target_scan_timeout", ("OPP_BATTLEFIELD_ITEM_TIMEOUT",), 0.0),
+    ("target_click_missed", ("found=False attempt=",), 0.0),
+    ("quest_no_fresh_data", ("Quest reroll: stale data",), 0.0),
+    ("quest_tile_missed", ("Quest reroll: skipped",), 0.0),
+    ("quest_reroll_failed", ("Quest reroll: failed",), 0.0),
     ("combat_force", ("COMBAT_RECOVERY_ATTEMPT",), 20.0),
     ("submit_img_fail", ("SUBMIT_SELECTION_IMG: image not found",), 20.0),
     ("unsupported_cast", ("not implemented yet", "chooser not implemented"), 30.0),
@@ -121,6 +129,8 @@ def _has_local_priority(status: dict) -> bool:
         priority_player = int(turn_info.get("priorityPlayer") or 0)
     except Exception:
         priority_player = 0
+    if priority_player > 0 and priority_player != local_seat:
+        return False
     return decision_player == local_seat or priority_player == local_seat
 
 

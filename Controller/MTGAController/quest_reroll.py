@@ -121,6 +121,9 @@ class QuestRerollMixin:
                 before = self._freshen_quest_reroll_snapshot()
             if before is None:
                 self._reroll_log("stale data", "no fresh startup/login quest response")
+                # No click was sent. A later Home landing can still obtain the
+                # authoritative response, so do not consume the one-shot.
+                self._quest_reroll_pending = True
                 return True
             if before.get("canSwap") is not True:
                 self._reroll_log("unavailable", "canSwap is false or unknown")
@@ -149,6 +152,7 @@ class QuestRerollMixin:
                 # later queue tick cannot pass an uncertain/overlaid screen.
                 if self._quest_reroll_home_visible():
                     self._reroll_log("skipped", "500-gold quest tile not recognized; Home rechecked")
+                    self._quest_reroll_pending = True
                     return True
                 self._quest_reroll_pending = True
                 return False

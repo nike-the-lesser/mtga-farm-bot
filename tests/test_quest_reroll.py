@@ -283,7 +283,16 @@ class LandingTests(RerollCase):
         self.assertFalse(c.reroll_quest_on_landing())
         self.assertTrue(c._quest_reroll_pending)
         self.assertTrue(c.reroll_quest_on_landing())
-        self.assertFalse(c._quest_reroll_pending)
+        self.assertTrue(c._quest_reroll_pending)
+
+    def test_missing_fresh_quest_response_is_retried_on_next_landing(self):
+        self.c._arm_quest_reroll()
+        self.assertTrue(self.c.reroll_quest_on_landing())
+        self.assertTrue(self.c._quest_reroll_pending)
+        self.c._click_abs.assert_not_called()
+        self.append(canSwap=True)
+        self.c.reroll_quest_on_landing()
+        self.assertIn("QUEST_REROLL_CONFIRM", self.tags())
 
     def test_dialog_cleanup_exception_keeps_flag_and_next_landing_resumes(self):
         c = self.c

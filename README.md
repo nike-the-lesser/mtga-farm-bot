@@ -526,5 +526,22 @@ Two things this was *not*, both of which cost a round of investigation:
 
 Diagnosing this class of failure: check `Initialize engine version` at the top of `Player.log` before blaming bot code, and count `"objectId"` occurrences in it — a session with none of them is an input problem, not a scan problem.
 
+### Temporary overnight soak diagnostics (2026-09)
+
+The session watchdog records `stall_concede`, `target_scan_timeout`,
+`target_click_missed`, `quest_no_fresh_data`, `quest_tile_missed`, and
+`quest_reroll_failed` in `runtime/analysis/alerts.log` and per-match records.
+After an overnight run, inspect those alerts, the matching lines in
+`runtime/analysis/history.log`, and any
+`runtime/debug/hand-select-*` bundle with reason
+`opponent_battlefield_select_failed`. A stall concede line includes the local
+seat, both priority fields, phase, step, and prompt. The target timeout line
+includes the cursor position and number of hover events seen before stopping.
+
+These six alert signatures and their classifier test are temporary. Remove them
+once the soak run has explained the failures. Keep the regression tests for the
+confirmed fixes.
+
 ## See also on
+
 [elitepvpers](https://www.elitepvpers.com/)

@@ -96,6 +96,19 @@ class StallSignatureTest(unittest.TestCase):
 
         self.assertEqual(self.signature(changed), baseline)
 
+    def test_opponent_priority_cannot_arm_stall_concede_with_stale_mulligan(self):
+        state = _state()
+        state["turnInfo"].update(decisionPlayer=1, priorityPlayer=2)
+        state["players"][0]["pendingMessageType"] = "ClientMessageType_MulliganResp"
+        self.assertIsNone(self.signature(state))
+
+    def test_kept_hand_ignores_stale_mulligan_prompt(self):
+        state = _state()
+        state["turnInfo"].update(decisionPlayer=2, priorityPlayer=None)
+        state["players"][0]["pendingMessageType"] = "ClientMessageType_MulliganResp"
+        self.controller._Controller__has_mulled_keep = True
+        self.assertIsNone(self.signature(state))
+
 
 class StallTimerRaceTest(unittest.TestCase):
     def test_timestamp_clear_during_age_calculation_does_not_raise(self):
