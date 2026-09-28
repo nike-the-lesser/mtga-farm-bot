@@ -1,8 +1,13 @@
 import unittest
+import json
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 from state.state_machine import BotState
-from tools.session_watchdog import _Thresholds, _classify_line, _detect_stuck_reason
+from tools.session_watchdog import (
+    _Thresholds, _classify_line, _detect_stuck_reason, _write_match_record,
+)
 
 
 class SessionWatchdogStallTests(unittest.TestCase):
@@ -54,7 +59,7 @@ class SessionWatchdogStallTests(unittest.TestCase):
         self.assertIsNone(_detect_stuck_reason(status, self.thresholds))
 
     def test_overnight_failure_signatures(self):
-        # TEMPORARY SOAK: remove with the six session_watchdog signatures.
+        # TEMPORARY SOAK: remove with the session_watchdog investigation signals.
         examples = {
             "STALL_WATCHDOG_TRIGGERED: priorityPlayer=2": "stall_concede",
             "OPP_BATTLEFIELD_ITEM_TIMEOUT: card 316": "target_scan_timeout",
@@ -66,6 +71,48 @@ class SessionWatchdogStallTests(unittest.TestCase):
         for line, expected in examples.items():
             with self.subTest(line=line):
                 self.assertEqual(_classify_line(line), expected)
+
+    def test_match_record_keeps_canonical_account_for_soak_attribution(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state = {"match": {"count": 0, "alerts": {}, "stalled": False, "session_dir": ""}}
+            status = {
+                "current_account": "Alias#12345",
+                "account_aliases": {"Alias#12345": "Configured Account"},
+            }
+            with patch("tools.session_watchdog._records_session_dir", return_value=root), \
+                    patch("tools.session_watchdog._append_text"), \
+                    patch("tools.session_watchdog._timestamp", return_value="2026-01-01 00:00:00"), \
+                    patch("tools.session_watchdog.time.time", return_value=1.0):
+                _write_match_record(
+                    state, "session", {"result": "won", "turns": 3, "duration": 10}, status
+                )
+
+            record = json.loads((root / "match-0001.json").read_text(encoding="utf-8"))
+            self.assertEqual(record["account"], "Configured Account")
+            self.assertEqual(record["schema_version"], 2)
+            self.assertNotIn("account_attribution_missing", record["alerts"])
+
+    def test_missing_match_account_emits_soak_signal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state = {"match": {"count": 0, "alerts": {}, "stalled": False, "session_dir": ""}}
+            with patch("tools.session_watchdog._records_session_dir", return_value=root), \
+                    patch("tools.session_watchdog._append_text"), \
+                    patch("tools.session_watchdog._history_path", return_value=root / "history.log"), \
+                    patch("tools.session_watchdog._timestamp", return_value="2026-01-01 00:00:00"), \
+                    patch("tools.session_watchdog.time.time", return_value=1.0):
+                _write_match_record(
+                    state, "session", {"result": "lost", "turns": 3, "duration": 10}, {}
+                )
+
+            record = json.loads((root / "match-0001.json").read_text(encoding="utf-8"))
+            self.assertIsNone(record["account"])
+            self.assertEqual(record["alerts"]["account_attribution_missing"], 1)
+            self.assertEqual(
+                _classify_line("MATCH_ACCOUNT_UNATTRIBUTED: session=session match=1"),
+                "account_attribution_missing",
+            )
 
     @patch("tools.session_watchdog.time.time", return_value=1000.0)
     def test_stall_is_ignored_without_local_priority(self, _time):

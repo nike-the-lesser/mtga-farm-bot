@@ -62,14 +62,15 @@ from tools.incident_tracking import (
 # cooldown throttles alerts.log writes only -- per-match counting still counts
 # every occurrence.
 ALERT_SIGNATURES: tuple[tuple[str, tuple[str, ...], float], ...] = (
-    # TEMPORARY SOAK (2026-09): remove these six signatures after the overnight
-    # concede / quest / creature-target investigation is complete.
+    # TEMPORARY SOAK (2026-09): remove these signatures after the overnight
+    # concede / quest / creature-target / account-attribution investigation.
     ("stall_concede", ("STALL_WATCHDOG_TRIGGERED",), 0.0),
     ("target_scan_timeout", ("OPP_BATTLEFIELD_ITEM_TIMEOUT",), 0.0),
     ("target_click_missed", ("found=False attempt=",), 0.0),
     ("quest_no_fresh_data", ("Quest reroll: stale data",), 0.0),
     ("quest_tile_missed", ("Quest reroll: skipped",), 0.0),
     ("quest_reroll_failed", ("Quest reroll: failed",), 0.0),
+    ("account_attribution_missing", ("MATCH_ACCOUNT_UNATTRIBUTED",), 0.0),
     ("combat_force", ("COMBAT_RECOVERY_ATTEMPT",), 20.0),
     ("submit_img_fail", ("SUBMIT_SELECTION_IMG: image not found",), 20.0),
     ("unsupported_cast", ("not implemented yet", "chooser not implemented"), 30.0),
@@ -365,10 +366,25 @@ def _write_match_record(state: dict, session_id: str, match: dict, status: dict)
         "id": str(status.get("active_quest_id") or ""),
         "colors": str(status.get("active_quest_colors") or ""),
     }
+    account = str(status.get("current_account") or "").strip()
+    aliases = status.get("account_aliases")
+    if account and isinstance(aliases, dict):
+        account = str(aliases.get(account) or account).strip()
+    if not account:
+        alerts = match_state.setdefault("alerts", {})
+        alerts["account_attribution_missing"] = int(alerts.get("account_attribution_missing", 0)) + 1
+        _append_text(
+            _history_path(),
+            f"[{_timestamp()}] [ERROR] MATCH_ACCOUNT_UNATTRIBUTED: "
+            f"session={session_id} match={index} current_account="
+            f"{status.get('current_account')!r} configured_aliases="
+            f"{bool(aliases)}\n",
+        )
     record = {
-        "schema_version": 1,
+        "schema_version": 2,
         "session_id": session_id,
         "match_index": index,
+        "account": account or None,
         "ended_at": _timestamp(),
         "ended_at_epoch": time.time(),
         "result": str(match.get("result") or "unknown"),

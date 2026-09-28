@@ -65,6 +65,25 @@ class RerollCase(unittest.TestCase):
     def tags(self):
         return [call.args[2] for call in self.c._click_abs.call_args_list]
 
+    def test_reroll_failure_bundle_saves_state_log_and_screenshot(self):
+        bundle = Path(self.directory.name) / "quest-reroll-test"
+        bundle.mkdir()
+        self.c._state_tracker.get_tail = Mock(return_value="recent quest log")
+        self.c._vision.capture.return_value = "screen"
+
+        with patch(
+            "Controller.MTGAController.quest_reroll.bot_logger.ensure_debug_dir",
+            return_value=str(bundle),
+        ):
+            self.c._write_quest_reroll_debug_bundle("home_not_verified")
+
+        state = json.loads((bundle / "quest_reroll_state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["reason"], "home_not_verified")
+        self.assertEqual((bundle / "log_tail.txt").read_text(encoding="utf-8"), "recent quest log")
+        self.c._vision.save_image.assert_called_once_with(
+            "screen", str(bundle / "full_screen.jpg")
+        )
+
 
 class SnapshotTests(RerollCase):
     def test_boolean_availability_and_compatibility(self):

@@ -14846,10 +14846,8 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                 )
                 if not submitted or not _valid():
                     return
-                # Ward and other client-side confirms are raised by the submit and
-                # emit nothing, so nothing else will ever tell us they are there.
-                # Until this hook existed the dialog just sat on screen until some
-                # later cast attempt tripped over it ~10s down the rope.
+                # Some client-side confirms appear after submit and emit no GRE
+                # message. Keep this post-submit probe for those cases too.
                 def _confirm_if_still_valid() -> None:
                     if not _valid():
                         return
@@ -14920,11 +14918,45 @@ class Controller(QuestRerollMixin, ControllerSecondary):
             )
             selected_update_seq = (self.__pending_target_select or {}).get("selected_update_seq", 0)
             deadline = time.monotonic() + 3.0 if clicked else None
-            threading.Timer(0.5, lambda: _attempt_submit(
-                attempt, clicked=clicked,
-                selected_update_seq=selected_update_seq,
-                acknowledgement_deadline=deadline,
-            )).start()
+
+            def _after_target_click() -> None:
+                if not _valid():
+                    return
+                if clicked:
+                    ack = getattr(self, "_Controller__ward_payment_ack", None)
+                    pending = self.__pending_target_select or {}
+                    ward_ack_matches = bool(
+                        ack
+                        and ack.get("target") == creature_id
+                        and pending.get("last_target") == creature_id
+                        and time.time() - float(ack.get("ts", 0.0))
+                        <= self._WARD_ACK_MAX_AGE_SEC
+                    )
+                    dismissed = self._dismiss_are_you_sure_if_present(
+                        context=f"TARGET_CLICK id={creature_id}",
+                        expected_match_id=expected_match_id,
+                    )
+                    if dismissed:
+                        if not ward_ack_matches:
+                            # The dialog was answered No. Do not keep clicking a
+                            # target that the client just rejected.
+                            pending["creature_target_flow_active"] = False
+                            return
+                        # Yes was justified by the exact ward we priced. Wait for
+                        # the resulting game-state acknowledgement before submit.
+                        _attempt_submit(
+                            attempt, clicked=True,
+                            selected_update_seq=selected_update_seq,
+                            acknowledgement_deadline=time.monotonic() + 3.0,
+                        )
+                        return
+                _attempt_submit(
+                    attempt, clicked=clicked,
+                    selected_update_seq=selected_update_seq,
+                    acknowledgement_deadline=deadline,
+                )
+
+            threading.Timer(0.5, _after_target_click).start()
 
         delay_remaining = self.__get_delay_timer_remaining()
         start_delay = 0.8
@@ -15138,6 +15170,33 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                         f"of {[tid for tid, _, _ in candidates]}"
                     )
                 return best_id, False
+            # Noncreature graveyard choices (for example Inspiration from
+            # Beyond) use mana value as a cheap, deterministic proxy for card
+            # quality. Read local card data only: chooser decisions must not
+            # wait on a network lookup while the game timer is running.
+            def _mana_value(candidate):
+                grp_id = candidate.get("grpId")
+                info = CardInfo.get_card_info_local(grp_id)
+                if not info:
+                    return -1
+                return CardInfo.calculate_cmc(info.get("manaCost", ""))
+
+            noncreature_candidates = [
+                (tid, obj) for tid, _, obj in candidates
+                if "CardType_Creature" not in (obj.get("cardTypes") or [])
+            ]
+            if noncreature_candidates:
+                ranked = [(_mana_value(obj), tid) for tid, obj in noncreature_candidates]
+                best_value = max(value for value, _ in ranked)
+                if best_value >= 0:
+                    best_id = next(tid for value, tid in ranked if value == best_value)
+                    if best_id != candidates[0][0]:
+                        bot_logger.log_info(
+                            f"CHOOSER_RANK: picking {best_id} (mana-value={best_value}) "
+                            f"over first-offered {candidates[0][0]} "
+                            f"of {[tid for tid, _, _ in candidates]}"
+                        )
+                    return best_id, False
             tid, is_stack, _ = candidates[0]
             return tid, is_stack
         except Exception as e:
