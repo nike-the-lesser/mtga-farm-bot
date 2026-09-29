@@ -11,6 +11,38 @@ from AI.DummyAI import DummyAI
 
 
 class UnknownManaColorTest(unittest.TestCase):
+    def test_treasure_token_is_one_any_color_source_without_scryfall(self):
+        ai = DummyAI()
+        debug = []
+        ai._debug = debug.append
+        actions = [{"action": {
+            "actionType": "ActionType_Activate_Mana",
+            "instanceId": 304,
+            "abilityGrpId": 183,
+        }}]
+        objects = [{
+            "instanceId": 304,
+            "grpId": 94178,
+            "type": "GameObjectType_Token",
+            "cardTypes": ["CardType_Artifact"],
+            "subtypes": ["SubType_Treasure"],
+        }]
+        with patch("AI.DummyAI.CardInfo.get_land_produced_colors") as scryfall_lookup:
+            colors, total, sources = ai._get_available_mana_colors(
+                actions, {304: 94178}, objects
+            )
+        scryfall_lookup.assert_not_called()
+        self.assertEqual(colors, {"white", "blue", "black", "red", "green"})
+        self.assertEqual(total, 1)
+        self.assertEqual(sources, [colors])
+        self.assertFalse(any("UNRESOLVED_MANA_DIAGNOSTIC" in line for line in debug))
+        self.assertTrue(ai._can_cast_with_mana_cost(
+            [{"color": ["ManaColor_Blue"], "count": 1}], colors, total, sources
+        ))
+        self.assertFalse(ai._can_cast_with_mana_cost(
+            [{"color": ["ManaColor_Blue"], "count": 2}], colors, total, sources
+        ))
+
     def test_unresolved_land_counts_for_generic_but_not_colored_costs(self):
         ai = DummyAI()
         debug = []

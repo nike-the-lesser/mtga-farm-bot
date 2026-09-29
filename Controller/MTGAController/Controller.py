@@ -81,6 +81,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
     # start_game_from_home_screen). After this many failed attempts the bot gives
     # up reading and just plays, rather than dipping to Home forever.
     _HOME_QUEST_CHECK_MAX_ATTEMPTS = 3
+    _POST_LOGIN_HOME_READY_TIMEOUT = 20.0
     _STALL_CONCEDE_MAX_ATTEMPTS = 2
     # Class-level fallback so instances built without __init__ (tests use
     # Controller.__new__) still serialise correctly; __init__ replaces it with a
@@ -2758,13 +2759,13 @@ class Controller(QuestRerollMixin, ControllerSecondary):
     # - Horizontal space only (`[ \t]*`) between its parts. With `\s*` the pattern
     #   spans newlines, so two unrelated fragments that happen to end and begin
     #   with those words would splice into a login event that was never logged.
-    # - The name is one whitespace-free token, not "the rest of the line". Arena
-    #   names have no spaces (`Name#12345`), and `[^\r\n]+` would swallow anything
-    #   the client appends after the name into the identity string -- which is then
-    #   the key for gold attribution, round tracking and the deck folder lookup.
+    # - A display name may contain spaces (live: `Lass E#94890`). Read through
+    #   its #discriminator, then stop: the client may append metadata such as
+    #   `(cached)` after the name. Old unhashed names retain the single-token
+    #   fallback instead of swallowing the rest of the line.
     _LOGIN_IDENTITY_RE = re.compile(
         r'"authenticateResponse"\s*:\s*\{[^}]*?"screenName"\s*:\s*"([^"]+)"'
-        r'|Logged in successfully\.[ \t]*Display Name:[ \t]*([^\s]+)'
+        r'|Logged in successfully\.[ \t]*Display Name:[ \t]*([^\r\n]*?#[0-9]+|[^\s]+)'
     )
 
     @classmethod
@@ -5949,7 +5950,29 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         # round this login belongs to.
         if self._stop_requested:
             return False
+        # A login can report HOME in Player.log while Unity still shows a black
+        # transition frame. Wait for a visible Home before any reroll or deck
+        # click; a failed check leaves the pending reroll for the queue loop.
+        deadline = time.monotonic() + self._POST_LOGIN_HOME_READY_TIMEOUT
+        while not self._stop_requested:
+            try:
+                ready = self._navigate_to_home() and self._quest_reroll_home_visible()
+            except Exception as exc:
+                ready = False
+                bot_logger.log_error(f"Post-login: Home readiness probe failed: {exc}")
+            if ready:
+                break
+            if time.monotonic() >= deadline:
+                bot_logger.log_error("Post-login: Home not visible; deferring reroll and deck selection.")
+                self._write_quest_reroll_debug_bundle("post_login_home_not_ready")
+                return False
+            time.sleep(1.0)
+        else:
+            return False
         if not self.reroll_quest_on_landing():
+            if self._quest_reroll_pending and not self._quest_reroll_home_visible():
+                bot_logger.log_info("Post-login: reroll deferred until Home is visible again.")
+                return False
             # This routine runs ONCE per login/switch (_post_login_action_done),
             # so returning False here drops the account's deck selection for good
             # -- it then queues with whatever deck the previous account left
@@ -9724,6 +9747,57 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                 except Exception: pass
                 setattr(self, attr, None)
 
+    def __write_stall_concede_soak_bundle(self, label: str, attempt: int,
+                                         expected_match_id: str | None,
+                                         stalled_signature) -> None:
+        """TEMPORARY SOAK DIAGNOSTIC: remove after stall/concede root cause is found."""
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        try:
+            debug_dir = Path(bot_logger.ensure_debug_dir(f"stall-concede-{stamp}"))
+        except Exception as exc:
+            bot_logger.log_error(f"{label}: soak bundle directory failed: {exc}")
+            return
+        try:
+            status = runtime_status.read_status()
+            payload = {
+                "label": label,
+                "attempt": attempt,
+                "match_id": expected_match_id,
+                "account": getattr(self, "_current_account_screen_name", None),
+                "state": str(self._get_state_from_log()),
+                "arena_region": getattr(self, "_arena_region", None),
+                "stalled_signature": repr(stalled_signature),
+                "turn_info": self.updated_game_state.get_turn_info() or {},
+                "actions_available": self.updated_game_state.get_actions() or [],
+                "pending_card_prompt": getattr(self, "_Controller__pending_card_prompt", None),
+                "pending_target_select": getattr(self, "_Controller__pending_target_select", None),
+                "pending_select_n": getattr(self, "_Controller__pending_select_n", None),
+                "pending_mulligan": getattr(self, "_Controller__pending_mulligan", None),
+                "last_decision_at_epoch": status.get("last_decision_at_epoch"),
+                "last_move_name": status.get("last_move_name"),
+                "last_input_tag": status.get("last_input_tag"),
+                "last_input_target": status.get("last_input_target"),
+                "recent_clicks": self.__recent_clicks_for_bundle(),
+            }
+            with (debug_dir / "pending_action.json").open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, default=str)
+        except Exception as exc:
+            bot_logger.log_error(f"{label}: soak action state failed: {exc}")
+        try:
+            tail = self._state_tracker.get_tail(180)
+            if not tail:
+                tail = self._read_log_tail(self._log_path, max_bytes=150000)
+            (debug_dir / "log_tail.txt").write_text(tail or "", encoding="utf-8")
+        except Exception as exc:
+            bot_logger.log_error(f"{label}: soak log tail failed: {exc}")
+        try:
+            self._vision.begin_tick()
+            full = self._vision.capture(None)
+            self._vision.save_image(full, str(debug_dir / "full_screen.jpg"))
+        except Exception as exc:
+            bot_logger.log_error(f"{label}: soak screenshot failed: {exc}")
+        bot_logger.log_info(f"{label}: pre-concede soak bundle saved: {debug_dir}")
+
     def __perform_concede(self, label: str, expected_match_id: str | None = None) -> None:
         try:
             runtime_status.set_mode("stuck_suspected", bot_state=str(self._get_state_from_log()))
@@ -9773,6 +9847,10 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     break
                 attempt += 1
                 bot_logger.log_info(f"{label}: concede sequence attempt {attempt}")
+                if label == "STALL_CONCEDE":
+                    self.__write_stall_concede_soak_bundle(
+                        label, attempt, expected_match_id, stalled_signature,
+                    )
                 self.__perform_concede(f"{label}_{attempt}", expected_match_id)
                 if self.__concede_completed_event.wait(timeout=4.0):
                     terminal_results = getattr(

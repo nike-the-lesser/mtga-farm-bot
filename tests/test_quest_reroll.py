@@ -284,7 +284,7 @@ class LandingTests(RerollCase):
 
         self.assertTrue(c._run_post_login_routine({"name": "incoming"}, []))
 
-        self.assertEqual(c._quest_reroll_home_visible.call_count, 2)
+        self.assertEqual(c._quest_reroll_home_visible.call_count, 3)
         c._run_post_login_navigation_oob.assert_called_once()
         c._choose_deck_image.assert_called_once_with({"name": "incoming"}, "", None)
         self.assertEqual(
@@ -312,6 +312,46 @@ class LandingTests(RerollCase):
         self.append(canSwap=True)
         self.c.reroll_quest_on_landing()
         self.assertIn("QUEST_REROLL_CONFIRM", self.tags())
+
+    def test_black_home_defers_one_shot_and_next_landing_submits_once(self):
+        # TEMPORARY SOAK DIAGNOSTIC: retain until the overnight reroll run is reviewed.
+        c = self.c
+        c._arm_quest_reroll()
+        self.append(canSwap=True)
+        c._navigate_to_home.side_effect = [False, True]
+        with patch.object(c, "_write_quest_reroll_debug_bundle") as bundle:
+            self.assertFalse(c.reroll_quest_on_landing())
+            self.assertTrue(c._quest_reroll_pending)
+            self.assertEqual(self.tags(), [])
+            bundle.assert_called_once_with("home_not_verified")
+        self.assertTrue(c.reroll_quest_on_landing())
+        self.assertEqual(self.tags().count("QUEST_REROLL_CONFIRM"), 1)
+        self.assertFalse(c._quest_reroll_pending)
+        self.assertTrue(c.reroll_quest_on_landing())
+        self.assertEqual(self.tags().count("QUEST_REROLL_CONFIRM"), 1)
+
+    def test_post_login_black_home_does_not_select_deck(self):
+        # TEMPORARY SOAK DIAGNOSTIC: retain until the overnight reroll run is reviewed.
+        c = self.c
+        c._POST_LOGIN_HOME_READY_TIMEOUT = 0
+        c._navigate_to_home.return_value = False
+        c._game_mode = "starter"
+        c._run_starter_deck_routine = Mock(return_value=True)
+        with patch.object(c, "_write_quest_reroll_debug_bundle") as bundle:
+            self.assertFalse(c._run_post_login_routine({}, []))
+        c._run_starter_deck_routine.assert_not_called()
+        c._click_abs.assert_not_called()
+        self.assertTrue(c._quest_reroll_pending)
+        bundle.assert_called_once_with("post_login_home_not_ready")
+
+    def test_navigation_probe_error_before_dialog_keeps_reroll_pending(self):
+        c = self.c
+        c._arm_quest_reroll()
+        self.append(canSwap=True)
+        c._navigate_to_home.side_effect = OSError("screen capture unavailable")
+        self.assertFalse(c.reroll_quest_on_landing())
+        self.assertTrue(c._quest_reroll_pending)
+        c._click_abs.assert_not_called()
 
     def test_dialog_cleanup_exception_keeps_flag_and_next_landing_resumes(self):
         c = self.c

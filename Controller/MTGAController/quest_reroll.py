@@ -72,7 +72,7 @@ class QuestRerollMixin:
         bot_logger.log_info(f"Quest reroll: {outcome}" + (f" ({detail})" if detail else "") + ".")
 
     def _write_quest_reroll_debug_bundle(self, reason):
-        """Capture the screen and freshness/navigation state at reroll failures."""
+        """TEMPORARY SOAK DIAGNOSTIC: remove after reroll readiness is verified live."""
         stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
         debug_dir = Path(bot_logger.ensure_debug_dir(f"quest-reroll-{stamp}"))
         payload = {
@@ -179,6 +179,9 @@ class QuestRerollMixin:
             if (not self._reroll_can_act() or not self._navigate_to_home()
                     or not self._quest_reroll_home_visible()):
                 self._reroll_log("failed", "Home not verified")
+                # No dialog-opening click was sent. A black login-transition
+                # frame must not consume this account's one allowed reroll.
+                self._quest_reroll_pending = True
                 self._write_quest_reroll_debug_bundle("home_not_verified")
                 return False
             # Re-read after navigation in case the user changed quests meanwhile.
@@ -258,7 +261,10 @@ class QuestRerollMixin:
                     return self._close_quest_reroll_dialog()
                 except Exception:
                     return False
-            return not self._stop_requested
+            # A pre-click vision/navigation exception is safe to retry. Once
+            # the dialog could have opened, the flag above prevents repeats.
+            self._quest_reroll_pending = True
+            return False
         finally:
             # A failed confirmation must not freeze quest reads for the rest of
             # the session. During verification a disappearing quest is rejected;

@@ -54,11 +54,15 @@ class DummyAI(AIKernel):
             - total_sources: number of unique mana sources (for CMC check)
             - sources: list of sets of colors per mana source
 
-        Note: For dual lands, we count them as providing BOTH colors but only 1 source.
-        Uses Scryfall to get the produced mana colors for all lands."""
+        Note: For dual lands and Treasure tokens, we count all offered colors
+        but only one mana source. Unknown sources can pay generic costs only."""
         mana_colors = set()
         mana_sources = {}  # instanceId -> set of colors
         mana_actions = {}
+        object_by_id = {
+            obj.get("instanceId"): obj for obj in (game_objects or [])
+            if isinstance(obj, dict) and obj.get("instanceId") is not None
+        }
 
         for action_wrapper in action_list:
             action = action_wrapper.get('action', {})
@@ -69,6 +73,18 @@ class DummyAI(AIKernel):
                     if instance_id not in mana_sources:
                         mana_sources[instance_id] = set()
                     mana_actions[instance_id] = action
+
+                    # Treasure is a token, so Scryfall's card-by-Arena-ID lookup
+                    # cannot identify it. Its available mana action produces one
+                    # mana of any color; count the token once as a five-color
+                    # source rather than treating it as a generic-only land.
+                    game_object = object_by_id.get(instance_id) or {}
+                    if (game_object.get("type") == "GameObjectType_Token"
+                            and "SubType_Treasure" in (game_object.get("subtypes") or [])):
+                        treasure_colors = {"white", "blue", "black", "red", "green"}
+                        mana_sources[instance_id].update(treasure_colors)
+                        mana_colors.update(treasure_colors)
+                        continue
 
                     # 1) Offline and exact: the action's own mana-ability id
                     # (duals expose one Activate_Mana action per color).
@@ -93,17 +109,13 @@ class DummyAI(AIKernel):
         # claim they can pay colored costs when their color cannot be resolved.
         # MTGA exposes actual mana abilities; an unresolved ability ID or
         # Scryfall metadata miss is treated as generic-only.
-        # mana of any color — treating it as nothing made the AI pass every
         for instance_id, colors in mana_sources.items():
             if not colors:
                 grp_id = inst_id_grp_id_dict.get(instance_id)
                 diagnostic_key = grp_id if grp_id is not None else instance_id
                 if diagnostic_key not in self.__unknown_mana_diagnostics:
                     self.__unknown_mana_diagnostics.add(diagnostic_key)
-                    game_object = next((
-                        obj for obj in (game_objects or [])
-                        if isinstance(obj, dict) and obj.get("instanceId") == instance_id
-                    ), None)
+                    game_object = object_by_id.get(instance_id)
                     object_fields = (
                         "instanceId", "grpId", "titleId", "name", "type", "types",
                         "cardTypes", "subtype", "subtypes", "zoneId", "controllerSeatId",

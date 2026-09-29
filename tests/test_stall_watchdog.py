@@ -1,6 +1,9 @@
 import copy
+import json
 import threading
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from Controller.MTGAController.Controller import Controller
@@ -359,6 +362,32 @@ class StallWatchdogSafetyTest(StallSignatureTest):
         run.assert_not_called()
         self.assertEqual(timer.call_args.args[0], 1.0)
         self.assertIs(self.controller._Controller__stall_watchdog_timer, timer.return_value)
+
+    def test_pre_concede_soak_bundle_records_screen_and_pending_action(self):
+        # TEMPORARY SOAK DIAGNOSTIC: retain until stall causes are identified.
+        controller = self.controller
+        controller.updated_game_state = GameState(_state())
+        controller._Controller__pending_target_select = {"source_id": 101, "last_target": 202}
+        controller._vision = mock.Mock()
+        controller._vision.capture.return_value = "screen"
+        controller._state_tracker = mock.Mock()
+        controller._state_tracker.get_tail.return_value = "recent player log"
+        controller._arena_region = (0, 0, 1920, 1080)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            with mock.patch("Controller.MTGAController.Controller.bot_logger.ensure_debug_dir", return_value=str(path)), \
+                 mock.patch.object(controller, "_Controller__recent_clicks_for_bundle", return_value=[{"label": "TARGET"}]):
+                controller._Controller__write_stall_concede_soak_bundle(
+                    "STALL_CONCEDE", 1, "match-1", ("target",),
+                )
+            payload = json.loads((path / "pending_action.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["pending_target_select"]["last_target"], 202)
+            self.assertEqual(payload["actions_available"][0]["actionType"], "ActionType_Pass")
+            self.assertEqual(payload["recent_clicks"][0]["label"], "TARGET")
+            self.assertEqual((path / "log_tail.txt").read_text(encoding="utf-8"), "recent player log")
+            controller._vision.save_image.assert_called_once_with(
+                "screen", str(path / "full_screen.jpg"),
+            )
 
     def test_stale_or_menu_state_cannot_arm_watchdog(self):
         self.controller.updated_game_state = GameState(_state())
