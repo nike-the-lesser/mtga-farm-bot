@@ -83,6 +83,8 @@ class Controller(QuestRerollMixin, ControllerSecondary):
     _HOME_QUEST_CHECK_MAX_ATTEMPTS = 3
     _POST_LOGIN_HOME_READY_TIMEOUT = 20.0
     _STALL_CONCEDE_MAX_ATTEMPTS = 2
+    _OPPONENT_BATTLEFIELD_SCAN_STEP = 70
+    _OPPONENT_BATTLEFIELD_SCAN_TIMEOUT = 8.0
     # Class-level fallback so instances built without __init__ (tests use
     # Controller.__new__) still serialise correctly; __init__ replaces it with a
     # per-instance lock.
@@ -489,6 +491,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         self.__card_prompt_token_counter = 0
         self.__target_submit_cooldown_sec = 1.0
         self.__pending_pay_costs_ts = 0.0
+        self.__pending_pay_costs_submit_state_id = None
         # Stack-deferral watchdog. The "Deferring decision: stack has N object(s)"
         # gate had no escape hatch: it re-deferred on every message, so a stack that
         # never resolved idled the bot into the rope (observed: 34s frozen on turn 16
@@ -8758,10 +8761,10 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                 card_id=card_id,
                 p1=scan_p1,
                 p2=scan_p2,
-                step=self.battlefield_scan_step,
+                step=self._OPPONENT_BATTLEFIELD_SCAN_STEP,
                 clicks=clicks,
                 label="OPP_BATTLEFIELD_ITEM",
-                max_scan_sec=6.0,
+                max_scan_sec=self._OPPONENT_BATTLEFIELD_SCAN_TIMEOUT,
             ):
                 return True
             bot_logger.log_error(
@@ -8804,8 +8807,12 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         reason: str = "unknown",
         force: bool = False,
         expected_match_id: str | None = None,
+        allow_okay_fallback: bool = True,
     ) -> bool:
         expected_match_id = expected_match_id or self.__live_match_id
+        pay_costs_submit_state_id = (
+            self.__read_game_state_id() if reason.startswith("pay_costs") else None
+        )
         if not self.can_execute_game_action(expected_match_id):
             bot_logger.log_info(
                 f"SubmitSelection cancelled: live match ended or input was suppressed. reason={reason}"
@@ -8859,14 +8866,22 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     scaled=True,
                 ):
                     self.__last_submit_selection_ts = time.time()
+                    if reason.startswith("pay_costs"):
+                        self.__pending_pay_costs_submit_state_id = (
+                            pay_costs_submit_state_id if pay_costs_submit_state_id is not None else -1
+                        )
                     return True
                 if not _still_active():
                     return False
                 if _locate_and_click(submit_img, "SUBMIT_SELECTION_IMG"):
                     self.__last_submit_selection_ts = time.time()
+                    if reason.startswith("pay_costs"):
+                        self.__pending_pay_costs_submit_state_id = (
+                            pay_costs_submit_state_id if pay_costs_submit_state_id is not None else -1
+                        )
                     return True
                 # submit_btn not on screen — try okay_btn as fallback (e.g. combat confirm)
-                if os.path.exists(okay_img):
+                if allow_okay_fallback and os.path.exists(okay_img):
                     if _locate_and_click(
                         okay_img,
                         "SUBMIT_OKAY_FALLBACK_IMG",
@@ -8882,8 +8897,17 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                         bot_logger.log_info("SUBMIT_SELECTION: submit_btn not found, clicked okay_btn as fallback")
                         self.__last_submit_selection_ts = time.time()
                         return True
+                bot_logger.log_error(
+                    f"SUBMIT_SELECTION_FAILED: no submit control recognized (reason={reason})"
+                )
                 return False
             if not _still_active():
+                return False
+            if not allow_okay_fallback:
+                bot_logger.log_error(
+                    f"SUBMIT_SELECTION_FAILED: submit template unavailable; refusing coordinate fallback "
+                    f"(reason={reason})"
+                )
                 return False
             target, source = self._map_abs_point_to_arena(
                 self.main_br_button_coordinates,
@@ -8909,6 +8933,10 @@ class Controller(QuestRerollMixin, ControllerSecondary):
             )
             self.input.left_click(1)
             self.__last_submit_selection_ts = time.time()
+            if reason.startswith("pay_costs"):
+                self.__pending_pay_costs_submit_state_id = (
+                    pay_costs_submit_state_id if pay_costs_submit_state_id is not None else -1
+                )
             return True
         finally:
             self.__submit_selection_lock.release()
@@ -9515,6 +9543,13 @@ class Controller(QuestRerollMixin, ControllerSecondary):
             prompt_kind = "assign_damage"
         elif self.__casting_time_options_until > time.time():
             prompt_kind = "casting_options"
+        # A prompt cached from an earlier GRE message is not sufficient proof
+        # that we still own the decision. In particular, Player.pendingMessageType
+        # can remain MulliganResp after the opponent has started their mulligan;
+        # priorityPlayer may be absent during that transition. Only arm recovery
+        # for a prompt when the current turn data assigns us the decision.
+        if prompt_kind is not None and not local_priority and priority_seat != my_seat:
+            return None
         if not local_priority and prompt_kind is None:
             return None
         try:
@@ -10344,6 +10379,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         self.__select_n_in_progress_since = 0.0
         self.__select_n_token_counter += 1
         self.__pending_pay_costs_ts = 0.0
+        self.__pending_pay_costs_submit_state_id = None
         # gameStateId restarts low every game; carrying the old one over would
         # make a fresh match look like it had already advanced.
         self.__latest_gre_state_id = None
@@ -10603,6 +10639,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         elif pattern == self.patterns["pay_costs"]:
             runtime_status.set_mode("in_game", bot_state=str(current_state))
             self.__pending_pay_costs_ts = time.time()
+            self.__pending_pay_costs_submit_state_id = None
             bot_logger.log_info("PayCostsReq detected: attempting auto-pay.")
             self.__handle_pay_costs_req(line_containing_pattern)
         elif pattern == self.patterns["casting_time_options"]:
@@ -13540,6 +13577,10 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                 max_sel = int(cost_sel.get("maxSel", 0) or 0)
 
                 if not ids or min_sel <= 0:
+                    bot_logger.log_info(
+                        "PAY_COSTS_UNRESOLVED: request has no recognized selectable-card cost; "
+                        "waiting for a confirmed game-state transition."
+                    )
                     continue
 
                 handled_selection = True
@@ -13635,7 +13676,15 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                                 )
                             time.sleep(0.25)
                         time.sleep(0.2)
-                        self.submit_selection(reason="pay_costs_selection_submit", force=True)
+                        submitted = self.submit_selection(
+                            reason="pay_costs_selection_submit", force=True,
+                            allow_okay_fallback=False,
+                        )
+                        if not submitted:
+                            bot_logger.log_error(
+                                "PAY_COSTS_UNRESOLVED: selected cost could not be submitted; "
+                                "keeping the decision blocked."
+                            )
                     except Exception as e:
                         bot_logger.log_error(f"PayCostsReq selection execution failed: {e}")
 
@@ -13650,10 +13699,18 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                 # the options overlay covering the board and the bot clicking
                 # blindly behind it. A real cancel needs the on-screen Cancel
                 # button (no template for it yet).
-                threading.Timer(0.6, lambda: self.submit_selection(reason="pay_costs_auto_submit", force=True)).start()
+                threading.Timer(
+                    0.6,
+                    lambda: self.submit_selection(
+                        reason="pay_costs_auto_submit", force=True,
+                        allow_okay_fallback=False,
+                    ),
+                ).start()
         except Exception as e:
             bot_logger.log_error(f"Failed to handle PayCostsReq: {e}")
-            threading.Timer(0.6, lambda: self.submit_selection(reason="pay_costs_error_fallback", force=True)).start()
+            bot_logger.log_error(
+                "PAY_COSTS_UNRESOLVED: handler failed; keeping the decision blocked."
+            )
 
     def __start_decision_heartbeat(self) -> None:
         try:
@@ -15293,6 +15350,8 @@ class Controller(QuestRerollMixin, ControllerSecondary):
             return
         self.__last_target_select_source_id = norm_source
         self.__last_target_select_ts = now
+        self.__update_pending_target_select(source_id, min_t=1)
+        selection_token = (self.__pending_target_select or {}).get("token")
         where = "stack" if is_stack_target else "overlay"
         bot_logger.log_info(f"{reason}: choosing card instanceId={target_id} from {where}")
         self.__record_decision(
@@ -15302,6 +15361,9 @@ class Controller(QuestRerollMixin, ControllerSecondary):
 
         def _do(attempt: int = 0) -> None:
             if self._suppress_selections or self._stop_requested:
+                return
+            pending = self.__pending_target_select or {}
+            if pending.get("token") != selection_token:
                 return
             found = False
             try:
@@ -15315,8 +15377,22 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                 f"CHOOSER_TARGET click: id={target_id} where={where} found={found} attempt={attempt}"
             )
             if found:
-                time.sleep(0.5)
-                self.submit_selection(reason="chooser_target_submit", force=True)
+                deadline = time.time() + 2.0
+                while time.time() < deadline:
+                    if self.__pending_target_ready_to_submit():
+                        submitted = self.submit_selection(
+                            reason="chooser_target_submit", force=True,
+                            allow_okay_fallback=False,
+                        )
+                        if not submitted:
+                            self.__write_target_debug_bundle("chooser_target_submit_failed")
+                        return
+                    time.sleep(0.1)
+                bot_logger.log_error(
+                    f"CHOOSER_TARGET_UNCONFIRMED: selected-card count did not reach minimum "
+                    f"for id={target_id}; leaving chooser open."
+                )
+                self.__write_target_debug_bundle("chooser_target_selection_unconfirmed")
             elif attempt < 2 and not (self._suppress_selections or self._stop_requested):
                 threading.Timer(1.0, lambda: _do(attempt + 1)).start()
             else:
@@ -15770,10 +15846,24 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         return selecting
 
     def __should_pause_for_pay_costs(self) -> bool:
-        if not self.__pending_pay_costs_ts:
-            return False
-        # Treat PayCostsReq as blocking for a short window.
-        return (time.time() - self.__pending_pay_costs_ts) < 3.0
+        # PayCostsReq remains blocking until a later game event explicitly
+        # resolves it. A timestamp TTL allowed the normal decision loop to
+        # submit stale actions while the cost modal was still open.
+        return bool(self.__pending_pay_costs_ts)
+
+    def __maybe_clear_pending_pay_costs(self) -> None:
+        submitted_state_id = self.__pending_pay_costs_submit_state_id
+        if submitted_state_id is None:
+            return
+        current_state_id = self.__read_game_state_id()
+        if current_state_id is None or current_state_id == submitted_state_id:
+            return
+        self.__pending_pay_costs_ts = 0.0
+        self.__pending_pay_costs_submit_state_id = None
+        bot_logger.log_info(
+            f"PayCostsReq resolved: game state advanced after submit "
+            f"({submitted_state_id} -> {current_state_id})."
+        )
 
     def __note_gre_state_id(self, raw_dict: dict) -> None:
         """Remember the newest gameStateId carried by any GRE message on a line.
@@ -16539,6 +16629,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
             # Clear the short blocking window to avoid stalling on combat submit.
             if self.__pending_pay_costs_ts:
                 self.__pending_pay_costs_ts = 0.0
+                self.__pending_pay_costs_submit_state_id = None
                 bot_logger.log_info("DeclareAttackersReq: cleared pending pay-costs pause")
             start = line.find("{")
             if start == -1:
@@ -16950,6 +17041,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         # Before the merge: a timer message advances this without touching the
         # merged state, and that is exactly the case the retry guard needs.
         self.__note_gre_state_id(raw_dict)
+        self.__maybe_clear_pending_pay_costs()
 
         game_state = Controller.__get_game_state_from_raw_dict(raw_dict, fallback_seat_id=self.__system_seat_id or 1)
         self.updated_game_state.update(game_state)

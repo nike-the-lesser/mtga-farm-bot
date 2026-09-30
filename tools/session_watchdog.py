@@ -71,9 +71,11 @@ ALERT_SIGNATURES: tuple[tuple[str, tuple[str, ...], float], ...] = (
     ("quest_tile_missed", ("Quest reroll: skipped",), 0.0),
     ("quest_reroll_failed", ("Quest reroll: failed",), 0.0),
     ("account_attribution_missing", ("MATCH_ACCOUNT_UNATTRIBUTED",), 0.0),
-    ("combat_force", ("COMBAT_RECOVERY_ATTEMPT",), 20.0),
-    ("submit_img_fail", ("SUBMIT_SELECTION_IMG: image not found",), 20.0),
-    ("unsupported_cast", ("not implemented yet", "chooser not implemented"), 30.0),
+    ("combat_recovery_failed", ("Combat recovery exhausted attempts.", "COMBAT_RECOVERY_DEFER:"), 20.0),
+    ("submit_failed", ("SUBMIT_SELECTION_FAILED:",), 20.0),
+    ("pay_costs_unresolved", ("PAY_COSTS_UNRESOLVED:",), 20.0),
+    ("chooser_unconfirmed", ("CHOOSER_TARGET_UNCONFIRMED:",), 20.0),
+    ("unsupported_cast", ("UNSUPPORTED_CAST:",), 30.0),
     # Game.py's stuck-move breaker (_STUCK_MOVE_RETRY_LIMIT): the same active
     # move (cast/attack/select_target/...) was returned unchanged 3x in a row
     # with no game-state progress and got force-replaced with resolve(). The

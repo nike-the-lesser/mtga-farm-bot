@@ -67,6 +67,13 @@ class SessionWatchdogStallTests(unittest.TestCase):
             "Quest reroll: stale data (no response).": "quest_no_fresh_data",
             "Quest reroll: skipped (tile missing).": "quest_tile_missed",
             "Quest reroll: failed (dialog missing).": "quest_reroll_failed",
+            "Combat recovery exhausted attempts.": "combat_recovery_failed",
+            "COMBAT_RECOVERY_ATTEMPT: 1/2 forcing all_attack": None,
+            "SUBMIT_SELECTION_FAILED: no submit control recognized (reason=spell)": "submit_failed",
+            "SUBMIT_SELECTION_IMG: image not found within 1.5s": None,
+            "PAY_COSTS_UNRESOLVED: handler failed": "pay_costs_unresolved",
+            "CHOOSER_TARGET_UNCONFIRMED: selection not acknowledged": "chooser_unconfirmed",
+            "UNSUPPORTED_CAST: skipping Undying Malice (grpId=123)": "unsupported_cast",
         }
         for line, expected in examples.items():
             with self.subTest(line=line):

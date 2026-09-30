@@ -6,7 +6,7 @@ from Controller.MTGAController.Controller import Controller
 
 
 class OpponentTargetScanTest(unittest.TestCase):
-    def test_full_width_scan_can_reach_a_lower_row(self):
+    def test_full_width_scan_finds_target_at_far_end_of_last_row_within_budget(self):
         controller = Controller.__new__(Controller)
         controller._Controller__live_match_id = "match"
         controller.can_execute_game_action = lambda expected_match_id=None: True
@@ -21,7 +21,8 @@ class OpponentTargetScanTest(unittest.TestCase):
             cursor[:] = [x, y]
 
         controller.input.move_abs.side_effect = move
-        controller.log_reader.has_new_line.side_effect = lambda _: cursor[1] >= 566
+        target = (2984, 556)
+        controller.log_reader.has_new_line.side_effect = lambda _: tuple(cursor) == target
         controller._Controller__parse_hover_id_line = lambda _: 316
         with patch("Controller.MTGAController.Controller.time.time", side_effect=lambda: clock[0]), \
              patch("Controller.MTGAController.Controller.time.sleep",
@@ -30,11 +31,12 @@ class OpponentTargetScanTest(unittest.TestCase):
              patch("Controller.MTGAController.Controller.bot_logger.log_click"), \
              patch("Controller.MTGAController.Controller.bot_logger.log_hover"):
             found = controller._Controller__select_object_in_region(
-                316, (1444, 346), (3018, 573), 55, 1,
-                "OPP_BATTLEFIELD_ITEM", max_scan_sec=6.0,
+                316, (1444, 346), (3018, 573), 70, 1,
+                "OPP_BATTLEFIELD_ITEM", max_scan_sec=8.0,
             )
         self.assertTrue(found)
-        self.assertEqual(cursor[1], 566)
+        self.assertEqual(tuple(cursor), target)
+        self.assertLessEqual(clock[0], 8.0)
         controller.input.left_click.assert_called_once()
 
     def test_scan_reaches_lower_row_and_records_a_miss(self):
@@ -53,7 +55,8 @@ class OpponentTargetScanTest(unittest.TestCase):
             self.assertFalse(controller.select_opponent_battlefield_permanent(316))
 
         kwargs = controller._Controller__select_object_in_region.call_args.kwargs
-        self.assertEqual(kwargs["max_scan_sec"], 6.0)
+        self.assertEqual(kwargs["max_scan_sec"], Controller._OPPONENT_BATTLEFIELD_SCAN_TIMEOUT)
+        self.assertEqual(kwargs["step"], Controller._OPPONENT_BATTLEFIELD_SCAN_STEP)
         self.assertEqual(kwargs["label"], "OPP_BATTLEFIELD_ITEM")
         self.assertEqual(
             controller._write_hand_select_debug_bundle.call_args.kwargs["reason"],

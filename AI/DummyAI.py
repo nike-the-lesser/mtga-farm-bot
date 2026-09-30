@@ -20,6 +20,7 @@ class DummyAI(AIKernel):
         self.__has_land_been_played_this_turn = False
         self.__known_battlefield_zones = set()
         self.__unknown_mana_diagnostics = set()
+        self.__unsupported_cast_logged = set()
         # AI debug lines go into the shared bot.log; without this assignment
         # _debug silently dropped every message (open() raised AttributeError).
         try:
@@ -35,6 +36,7 @@ class DummyAI(AIKernel):
         self.__has_land_been_played_this_turn = False
         self.__known_battlefield_zones = set()
         self.__unknown_mana_diagnostics.clear()
+        self.__unsupported_cast_logged.clear()
         self._debug("AI state reset complete")
 
     def _debug(self, message):
@@ -862,9 +864,12 @@ class DummyAI(AIKernel):
                         # (e.g. return-from-graveyard) is not implemented yet;
                         # the bot cannot click it and would stall the game.
                         if CardPolicy.is_unsupported_to_cast(grp_id):
-                            self._debug(
-                                f"Skipping {card_name}: in-resolution chooser not implemented yet."
-                            )
+                            if grp_id not in self.__unsupported_cast_logged:
+                                self.__unsupported_cast_logged.add(grp_id)
+                                self._debug(
+                                    f"UNSUPPORTED_CAST: skipping {card_name} (grpId={grp_id}); "
+                                    "in-resolution chooser is not implemented."
+                                )
                             continue
                         # A second copy of a legend we already control is legal,
                         # so MTGA offers it -- and then blocks the cast behind a
