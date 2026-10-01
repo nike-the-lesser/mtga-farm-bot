@@ -518,11 +518,43 @@ class LandingTests(RerollCase):
 
 
 class VisionGuardTests(RerollCase):
+    @unittest.skipIf(cv2 is None, "OpenCV not installed")
+    def test_live_500_label_is_detected_in_each_daily_quest_slot(self):
+        """Replay the real Home reward pixels without accessing the desktop."""
+        c = self.c
+        tile = cv2.imread(str(Path(__file__).parent / "fixtures" / "quest_gold_500.png"))
+        self.assertIsNotNone(tile)
+        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        c._vision.capture.return_value = frame
+
+        def locate(path, label, *, rel_region, confidence, **kwargs):
+            x, y, w, h = rel_region
+            template = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            crop = cv2.cvtColor(frame[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
+            _, score, _, pos = cv2.minMaxLoc(cv2.matchTemplate(
+                crop, template, cv2.TM_CCOEFF_NORMED))
+            if score < confidence:
+                return None
+            return (x + pos[0] + template.shape[1] // 2,
+                    y + pos[1] + template.shape[0] // 2)
+
+        c._locate_image_center_in_scaled_arena_region.side_effect = locate
+        for tile_x in (80, 360, 640, 940):
+            with self.subTest(tile_x=tile_x):
+                frame[:] = 0
+                frame[810:940, tile_x:tile_x+130] = tile
+                point = Controller._find_500_gold_quest_tile(c)
+                if tile_x == 940:
+                    self.assertIsNone(point, "win rewards must be excluded")
+                else:
+                    self.assertIsNotNone(point)
+                    self.assertAlmostEqual(point[0], tile_x + 62, delta=2)
+
     def test_leftmost_visual_tile_not_log_order(self):
         c = self.c
         c._reroll_match = Mock(side_effect=[None, (540, 900), (830, 900)])
         self.assertEqual(Controller._find_500_gold_quest_tile(c), (540, 900))
-        self.assertEqual([call.args[1][0] for call in c._reroll_match.call_args_list], [150, 450])
+        self.assertEqual([call.args[1][0] for call in c._reroll_match.call_args_list], [50, 330])
         self.assertTrue(all(call.kwargs["confidence"] == 0.82
                             for call in c._reroll_match.call_args_list))
 

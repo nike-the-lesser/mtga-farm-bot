@@ -4167,7 +4167,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         After winning games the event shows a full-window 'Reward' popup with a
         Claim button; it covers the Play/Events controls, so the queue loop gets
         stuck retrying navigation forever. This is template-gated (Buttons/claim.png)
-        so it is a safe no-op on any screen where the Claim button is absent.
+        with screen guards to reject ordinary orange Play buttons.
 
         The template alone is NOT a sufficient gate: claim.png scores above
         threshold on the event landing page's orange "Play" button, which lives in
@@ -4177,8 +4177,9 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         path that swaps in the quest-matched deck was never reached and the bot
         kept replaying the first deck it ever picked (observed live: 18 "Reward
         screen detected" events in a session with zero wins, i.e. no reward screen
-        existed at all). So a match is only trusted after confirming we are NOT on
-        the event landing page.
+        existed at all). Home's Play button also matches and caused a loop of
+        false claims followed by reroll navigation back to Home. Reject both
+        the bright active Home screen and the event landing page before claiming.
 
         That cross-check ASSUMES the reward popup is full-window and covers the
         event Play button, i.e. the two screens are mutually exclusive -- verified
@@ -4201,6 +4202,12 @@ class Controller(QuestRerollMixin, ControllerSecondary):
             confidence=0.80, timeout=1.5,
         )
         if point is None or not self._starter_navigation_may_act():
+            return False
+        # Home's orange Play button also matches claim.png. A bright, active
+        # Home anchor proves normal navigation owns the screen; the brightness
+        # check rejects the dimmed anchor behind a modal reward popup.
+        if self._quest_reroll_home_visible():
+            bot_logger.log_info("Reward claim candidate ignored: Home is visible; continuing queue navigation.")
             return False
         # Candidate match -- verify before clicking. Done only now, so the extra
         # probe costs nothing on the common path where no claim-like button is up.

@@ -364,10 +364,11 @@ class QuestRerollMixin:
         return point
 
     def _find_500_gold_quest_tile(self):
-        # Measured from Arena Home at 1280x720, normalized to the existing
-        # 1920x1080 frame. Each band contains one daily quest; daily/weekly win
-        # rewards begin to the RIGHT of these three bands and are excluded.
-        for x in (150, 450, 750):
+        # Live Home reward centres in the 1920x1080 frame are about x=142,
+        # 422, 702. Keep the entire reward label inside each band: the old
+        # 150/450/750 starts excluded the first label and split the second.
+        # Win rewards begin around x=940 and remain outside these bands.
+        for x in (50, 330, 610):
             # The reward emblem is small and has changed slightly between Arena
             # client releases. Keep this tolerant match within only the three
             # daily-quest bands; the brightness guard still rejects dimmed UI.

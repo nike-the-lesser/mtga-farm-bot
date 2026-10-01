@@ -41,6 +41,8 @@ class RewardPopupGuardTests(unittest.TestCase):
         with open(os.path.join(self.buttons, "claim.png"), "wb") as f:
             f.write(b"not-a-real-png")
         self.c._buttons_dir = lambda: self.buttons
+        self.c._quest_reroll_home_visible = Mock(return_value=False)
+        self.c._click_image_in_scaled_arena_region = Mock(return_value=False)
 
         self.clicks: list[tuple[int, int, str]] = []
         self.c._click_abs = lambda x, y, tag, **kw: self.clicks.append((x, y, tag))
@@ -92,6 +94,14 @@ class RewardPopupGuardTests(unittest.TestCase):
 
         self.assertTrue(self.c._dismiss_reward_popup())
         self.assertEqual(self.clicks, [(CLAIM_POINT[0], CLAIM_POINT[1], "REWARD_CLAIM")])
+
+    def test_home_play_button_is_not_claimed(self):
+        self._stub_vision(claim_at=CLAIM_POINT, on_event_page=False)
+        self.c._quest_reroll_home_visible.return_value = True
+
+        self.assertFalse(self.c._dismiss_reward_popup())
+        self.assertEqual(self.clicks, [])
+        self.assertEqual(self.probed, [])
 
     def test_guard_probe_runs_only_after_a_candidate_match(self):
         """Ordering matters for cost: the event-page probe is an extra template
@@ -153,6 +163,7 @@ class DeckSwapRestoredTests(unittest.TestCase):
             with open(os.path.join(self.buttons, name), "wb") as f:
                 f.write(b"not-a-real-png")
         self.c._buttons_dir = lambda: self.buttons
+        self.c._quest_reroll_home_visible = Mock(return_value=False)
 
         patcher = patch("Controller.MTGAController.Controller.time.sleep")
         patcher.start()
