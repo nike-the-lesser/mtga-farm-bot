@@ -40,6 +40,7 @@ from vision.window_locator import (
 )
 import bot_logger
 import debug_recorder
+from concede_diagnostics import ConcedeIncident
 import runtime_status
 from runtime_paths import runtime_file
 
@@ -1626,6 +1627,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                 "current_pos": [int(current_pos[0]), int(current_pos[1])] if current_pos is not None else None,
                 "current_hovered_id": current_hovered_id,
                 "pending_select_n": self.__pending_select_n,
+                "pending_target_select": self.__pending_target_select,
                 "select_n_in_progress": self.__select_n_in_progress,
                 # An open search/order window is the one state that makes a hand
                 # scan hopeless -- record it so a bundle answers "was a modal
@@ -8754,7 +8756,8 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         """
         return self.select_opponent_battlefield_permanent(card_id, clicks=clicks)
 
-    def select_opponent_battlefield_permanent(self, card_id: int, clicks: int = 1) -> bool:
+    def select_opponent_battlefield_permanent(self, card_id: int, clicks: int = 1,
+                                             *, max_scan_sec: float | None = None) -> bool:
         """Select an opponent's permanent by hover-scanning the upper arena band
         for the matching objectId. Mirror of select_battlefield_permanent.
 
@@ -8771,7 +8774,8 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                 step=self._OPPONENT_BATTLEFIELD_SCAN_STEP,
                 clicks=clicks,
                 label="OPP_BATTLEFIELD_ITEM",
-                max_scan_sec=self._OPPONENT_BATTLEFIELD_SCAN_TIMEOUT,
+                max_scan_sec=(self._OPPONENT_BATTLEFIELD_SCAN_TIMEOUT
+                              if max_scan_sec is None else max_scan_sec),
             ):
                 return True
             bot_logger.log_error(
@@ -8828,6 +8832,8 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         if not self.__submit_selection_lock.acquire(blocking=False):
             bot_logger.log_info(f"SubmitSelection skipped (already running). reason={reason}")
             return False
+        target_token = (self.__pending_target_select or {}).get("token")
+        target_clicked = False
         try:
             def _still_active() -> bool:
                 return self.can_execute_game_action(expected_match_id)
@@ -8839,6 +8845,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                 rel_region: tuple[int, int, int, int] | None = None,
                 scaled: bool = False,
             ) -> bool:
+                nonlocal target_clicked
                 if not _still_active():
                     return False
                 if scaled:
@@ -8858,6 +8865,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                 if point is None or not _still_active():
                     return False
                 self._click_abs(point[0], point[1], label)
+                target_clicked = True
                 return True
 
             if not force and not self.__selection_submit_allowed():
@@ -8939,6 +8947,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                 source=source, region_age=self._region_age(), arena=self._arena_region,
             )
             self.input.left_click(1)
+            target_clicked = True
             self.__last_submit_selection_ts = time.time()
             if reason.startswith("pay_costs"):
                 self.__pending_pay_costs_submit_state_id = (
@@ -8947,6 +8956,8 @@ class Controller(QuestRerollMixin, ControllerSecondary):
             return True
         finally:
             self.__submit_selection_lock.release()
+            if target_token is not None:
+                self.__watch_target_submission(target_token, target_clicked, reason)
 
     def resolve(self) -> None:
         expected_match_id = self.__live_match_id
@@ -9789,57 +9800,6 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                 except Exception: pass
                 setattr(self, attr, None)
 
-    def __write_stall_concede_soak_bundle(self, label: str, attempt: int,
-                                         expected_match_id: str | None,
-                                         stalled_signature) -> None:
-        """TEMPORARY SOAK DIAGNOSTIC: remove after stall/concede root cause is found."""
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        try:
-            debug_dir = Path(bot_logger.ensure_debug_dir(f"stall-concede-{stamp}"))
-        except Exception as exc:
-            bot_logger.log_error(f"{label}: soak bundle directory failed: {exc}")
-            return
-        try:
-            status = runtime_status.read_status()
-            payload = {
-                "label": label,
-                "attempt": attempt,
-                "match_id": expected_match_id,
-                "account": getattr(self, "_current_account_screen_name", None),
-                "state": str(self._get_state_from_log()),
-                "arena_region": getattr(self, "_arena_region", None),
-                "stalled_signature": repr(stalled_signature),
-                "turn_info": self.updated_game_state.get_turn_info() or {},
-                "actions_available": self.updated_game_state.get_actions() or [],
-                "pending_card_prompt": getattr(self, "_Controller__pending_card_prompt", None),
-                "pending_target_select": getattr(self, "_Controller__pending_target_select", None),
-                "pending_select_n": getattr(self, "_Controller__pending_select_n", None),
-                "pending_mulligan": getattr(self, "_Controller__pending_mulligan", None),
-                "last_decision_at_epoch": status.get("last_decision_at_epoch"),
-                "last_move_name": status.get("last_move_name"),
-                "last_input_tag": status.get("last_input_tag"),
-                "last_input_target": status.get("last_input_target"),
-                "recent_clicks": self.__recent_clicks_for_bundle(),
-            }
-            with (debug_dir / "pending_action.json").open("w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2, default=str)
-        except Exception as exc:
-            bot_logger.log_error(f"{label}: soak action state failed: {exc}")
-        try:
-            tail = self._state_tracker.get_tail(180)
-            if not tail:
-                tail = self._read_log_tail(self._log_path, max_bytes=150000)
-            (debug_dir / "log_tail.txt").write_text(tail or "", encoding="utf-8")
-        except Exception as exc:
-            bot_logger.log_error(f"{label}: soak log tail failed: {exc}")
-        try:
-            self._vision.begin_tick()
-            full = self._vision.capture(None)
-            self._vision.save_image(full, str(debug_dir / "full_screen.jpg"))
-        except Exception as exc:
-            bot_logger.log_error(f"{label}: soak screenshot failed: {exc}")
-        bot_logger.log_info(f"{label}: pre-concede soak bundle saved: {debug_dir}")
-
     def __perform_concede(self, label: str, expected_match_id: str | None = None) -> None:
         try:
             runtime_status.set_mode("stuck_suspected", bot_state=str(self._get_state_from_log()))
@@ -9850,6 +9810,11 @@ class Controller(QuestRerollMixin, ControllerSecondary):
             if not self.__is_live_match(expected_match_id):
                 return
             if focus_mtga_window(): time.sleep(0.3)
+            if not self.__is_live_match(expected_match_id):
+                return
+            incident = getattr(self, "_Controller__active_concede_incident", None)
+            if incident is not None:
+                incident.capture(self._vision, self._arena_region_provider)
             if not self.__is_live_match(expected_match_id):
                 return
             self.input.tap_escape(); time.sleep(0.8)
@@ -9877,6 +9842,8 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         attempt = 0
         completed = False
         cancelled = False
+        incident = ConcedeIncident.create(label, expected_match_id)
+        self.__active_concede_incident = incident
         try:
             while (
                 attempt < self._STALL_CONCEDE_MAX_ATTEMPTS
@@ -9889,10 +9856,8 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     break
                 attempt += 1
                 bot_logger.log_info(f"{label}: concede sequence attempt {attempt}")
-                if label == "STALL_CONCEDE":
-                    self.__write_stall_concede_soak_bundle(
-                        label, attempt, expected_match_id, stalled_signature,
-                    )
+                if incident is not None:
+                    incident.start_attempt(attempt)
                 self.__perform_concede(f"{label}_{attempt}", expected_match_id)
                 if self.__concede_completed_event.wait(timeout=4.0):
                     terminal_results = getattr(
@@ -9922,6 +9887,13 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     "resuming normal play until game progress."
                 )
         finally:
+            self.__active_concede_incident = None
+            if incident is not None:
+                outcome = ("match_completion_observed" if completed else
+                           "stop_requested" if self._stop_requested else
+                           "attempts_exhausted" if self.__concede_outcome == "attempt_limit" else
+                           "cancelled")
+                incident.finish(outcome)
             # Keep exclusivity through the final confirm/result transition, then
             # hand input back before the delayed post-match dismissal runs.
             release_input = getattr(getattr(self, "input", None), "release_exclusive", None)
@@ -14111,7 +14083,12 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     continue
                 req = message.get("selectTargetsReq", {}) or {}
                 source_id = req.get("sourceId")
-                self.__update_pending_target_select(source_id)
+                self.__remember_target_request(req, message.get("allowCancel"))
+                if self.__try_handle_fiery_equipment():
+                    continue
+                if self.__pending_target_ready_to_submit():
+                    self.__schedule_ready_target_submit()
+                    continue
                 # Two-target pump-fight spells (e.g. Felling Blow) need both a
                 # friendly and an enemy creature picked -- handle before the
                 # single-target paths.
@@ -14502,6 +14479,12 @@ class Controller(QuestRerollMixin, ControllerSecondary):
 
     def __pending_target_ready_to_submit(self) -> bool:
         pending = self.__pending_target_select or {}
+        if "groups" in pending:
+            groups = pending["groups"]
+            return bool(groups) and all(
+                g["min"] is not None and g["selected"] is not None and g["max"] is not None
+                and g["min"] <= g["selected"] <= g["max"] for g in groups
+            )
         selected = pending.get("selected")
         min_t = pending.get("min", 1)
         try:
@@ -14513,6 +14496,293 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         except Exception:
             min_req = 1
         return selected_count >= min_req
+
+    def __remember_target_request(self, req, allow_cancel=None) -> None:
+        """Keep every GRE target group; omitted protobuf counts mean zero.
+
+        Selection updates belong to the same stage. A changed group/prompt or
+        candidate set invalidates callbacks even when the source is unchanged.
+        """
+        def count(group, key):
+            value = group.get(key, 0)
+            return value if type(value) is int and value >= 0 else None
+
+        groups = []
+        for group in req.get("targets", []) or []:
+            groups.append({
+                "idx": group.get("targetIdx"),
+                "prompt": group.get("prompt", {}).get("promptId"),
+                "min": count(group, "minTargets"),
+                "max": count(group, "maxTargets"),
+                "selected": count(group, "selectedTargets"),
+                "targets": [dict(t) for t in group.get("targets", []) or []],
+            })
+        stage = tuple((g["idx"], g["prompt"], g["min"], g["max"],
+                       tuple(sorted(t.get("targetInstanceId") for t in g["targets"]
+                                    if type(t.get("targetInstanceId")) is int)))
+                      for g in groups)
+        pending = self.__pending_target_select or {}
+        changed = pending.get("stage") != stage
+        if changed and pending.get("source_id") == req.get("sourceId", -1):
+            self.__pending_target_select = None
+        self.__update_pending_target_select(req.get("sourceId"), allow_cancel=allow_cancel)
+        pending = self.__pending_target_select
+        pending.update(groups=groups, stage=stage)
+        if groups:
+            pending.update(min=groups[0]["min"], max=groups[0]["max"],
+                           selected=groups[0]["selected"])
+            pending["selected_update_seq"] = pending.get("selected_update_seq", 0) + 1
+        if changed:
+            self.__last_target_select_source_id = None
+
+    def __zero_target_submit_eligible(self) -> bool:
+        groups = (self.__pending_target_select or {}).get("groups", [])
+        return self.__pending_target_ready_to_submit() and any(
+            g["min"] == 0 and g["selected"] == 0 for g in groups
+        )
+
+    def __write_optional_target_soak(self, event, *, match_id, token,
+                                    bundle_dir=None, target_id=None, point=None):
+        """TEMPORARY SOAK: remove this helper/calls after the next live audits.
+
+        One bundle per Equipment/Submit-0 operation, with labelled before/after
+        screenshots and request state. Diagnostics never authorize input.
+        """
+        try:
+            if bundle_dir is None:
+                stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                bundle_dir = bot_logger.ensure_debug_dir(f"optional-target-soak-{stamp}")
+            folder = Path(bundle_dir)
+            status = runtime_status.read_status()
+            pending = self.__pending_target_select or {}
+            started = getattr(self, "_Controller__stall_context_started_at", None)
+            payload = {
+                "temporary_soak": True, "event": event,
+                "session_id": status.get("session_id"), "match_id": match_id,
+                "account": getattr(self, "_current_account_screen_name", None),
+                "source_id": pending.get("source_id"), "expected_token": token,
+                "target_id": target_id, "button_point": point,
+                "submit_zero_confidence": 0.85,
+                "captured_at_epoch": time.time(),
+                "stall_age_sec": time.monotonic() - started if started is not None else None,
+                "arena_region": getattr(self, "_arena_region", None),
+                "pending_target_select": pending,
+                "turn_info": self.updated_game_state.get_turn_info() or {},
+            }
+            (folder / f"{event}.json").write_text(
+                json.dumps(payload, indent=2, default=str), encoding="utf-8")
+            vision = getattr(self, "_vision", None)
+            if vision is not None:
+                vision.begin_tick()
+                full = vision.capture(None)
+                vision.save_image(full, str(folder / f"{event}.jpg"))
+            bot_logger.log_info(f"OPTIONAL_TARGET_SOAK: event={event} match={match_id} "
+                                f"token={token} target={target_id} bundle={folder}")
+            return str(folder)
+        except Exception as exc:
+            bot_logger.log_error(f"OPTIONAL_TARGET_SOAK_FAILED: event={event} error={exc}")
+            return bundle_dir
+
+    def __target_recovery_exhausted(self, reason: str) -> bool:
+        """Final target recovery, called by retry owners, never by the watchdog."""
+        pending = self.__pending_target_select or {}
+        if (not self.__zero_target_submit_eligible()
+                or pending.get("zero_recovery_attempted")
+                or pending.get("equipment_flow_active")
+                or pending.get("zero_recovery_queued")):
+            return False
+        match_id = getattr(self, "_Controller__live_match_id", None)
+        if not self.can_execute_game_action(match_id):
+            return False
+        token = pending.get("token")
+        pending["zero_recovery_queued"] = True
+        bot_logger.log_info(f"TARGET_RECOVERY_EXHAUSTED: reason={reason} "
+                            f"source={pending.get('source_id')} groups={pending.get('groups')}")
+
+        def recover():
+            current = self.__pending_target_select or {}
+            if (current.get("token") != token
+                    or not self.can_execute_game_action(match_id)
+                    or not self.__zero_target_submit_eligible()):
+                if current.get("token") == token:
+                    current.pop("zero_recovery_queued", None)
+                return
+            # A submit operation may still be unwinding its finally block.
+            if not self.__submit_selection_lock.acquire(blocking=False):
+                threading.Timer(0.2, recover).start()
+                return
+            try:
+                current.pop("zero_recovery_queued", None)
+                current["zero_recovery_attempted"] = True
+                image_path = os.path.join(self._buttons_dir(), "submit_zero_btn.png")
+                point = self._locate_image_center_in_scaled_arena_region(
+                    image_path, "SUBMIT_ZERO", rel_region=(1320, 720, 600, 320),
+                    confidence=0.85, timeout=1.0, use_direct=False,
+                )
+                soak_dir = self.__write_optional_target_soak(
+                    "zero_before_click", match_id=match_id, token=token, point=point)
+                current = self.__pending_target_select or {}
+                turn = self.updated_game_state.get_turn_info() or {}
+                local = getattr(self, "_Controller__system_seat_id", None)
+                if (current.get("token") != token
+                        or not self.can_execute_game_action(match_id)
+                        or turn.get("decisionPlayer") != local
+                        or not self.__zero_target_submit_eligible()):
+                    self.__write_optional_target_soak(
+                        "zero_cancelled", match_id=match_id, token=token,
+                        bundle_dir=soak_dir, point=point)
+                    return
+                if point is None:
+                    bot_logger.log_info(f"SUBMIT_ZERO_FAILED: button absent reason={reason}")
+                    self.__write_optional_target_soak(
+                        "zero_not_found", match_id=match_id, token=token, bundle_dir=soak_dir)
+                    self.__write_target_debug_bundle("submit_zero_not_found")
+                    if current.get("cancel_after_zero_failure"):
+                        self.input.tap_escape()
+                    return
+                self._click_abs(*point, "SUBMIT_ZERO")
+                self.__last_submit_selection_ts = time.time()
+                bot_logger.log_info(f"SUBMIT_ZERO_ATTEMPT: source={current.get('source_id')} reason={reason}")
+            finally:
+                self.__submit_selection_lock.release()
+
+            def check_result():
+                current = self.__pending_target_select or {}
+                if not self.can_execute_game_action(match_id):
+                    outcome = "zero_cancelled"
+                    bot_logger.log_info(f"SUBMIT_ZERO_CANCELLED: match ended or input stopped reason={reason}")
+                elif current.get("token") != token:
+                    outcome = "zero_acknowledged"
+                    bot_logger.log_info(f"SUBMIT_ZERO_ACKNOWLEDGED: reason={reason}")
+                else:
+                    outcome = "zero_unconfirmed"
+                    bot_logger.log_error(f"SUBMIT_ZERO_UNCONFIRMED: reason={reason}")
+                    self.__write_target_debug_bundle("submit_zero_unconfirmed")
+                    if current.get("cancel_after_zero_failure"):
+                        self.input.tap_escape()
+                self.__write_optional_target_soak(
+                    outcome, match_id=match_id, token=token, bundle_dir=soak_dir, point=point)
+            threading.Timer(3.0, check_result).start()
+
+        threading.Timer(0.0, recover).start()
+        return True
+
+    def __watch_target_submission(self, token, clicked: bool, reason: str) -> None:
+        pending = self.__pending_target_select or {}
+        if pending.get("token") != token or not pending.get("groups"):
+            return
+        def check():
+            current = self.__pending_target_select or {}
+            if current.get("token") == token:
+                self.__target_recovery_exhausted(f"submit_{'unconfirmed' if clicked else 'failed'}:{reason}")
+        threading.Timer(3.0 if clicked else 0.0, check).start()
+
+    def __schedule_ready_target_submit(self) -> None:
+        pending = self.__pending_target_select or {}
+        if pending.get("ready_submit_started"):
+            return
+        pending["ready_submit_started"] = True
+        token = pending.get("token")
+        match_id = self.__live_match_id
+        def submit():
+            if ((self.__pending_target_select or {}).get("token") == token
+                    and self.can_execute_game_action(match_id)
+                    and self.__pending_target_ready_to_submit()):
+                if self.__submit_selection_lock.locked():
+                    threading.Timer(0.2, submit).start()
+                    return
+                if not self.submit_selection(reason="target_selection_ready", expected_match_id=match_id):
+                    self.__target_recovery_exhausted("ready_submit_failed")
+        threading.Timer(0.2, submit).start()
+
+    def __try_handle_fiery_equipment(self) -> bool:
+        pending = self.__pending_target_select or {}
+        groups = pending.get("groups", [])
+        if len(groups) != 2 or not self.__pending_target_ready_to_submit():
+            return False
+        source_id = pending.get("source_id")
+        objects = self.updated_game_state.get_game_objects() or []
+        source = next((o for o in objects if o.get("instanceId") == source_id), {})
+        grp_id = source.get("grpId")
+        info = CardInfo.get_card_info_local(grp_id) if grp_id != 93799 else None
+        if grp_id != 93799 and (info or {}).get("name") != "Fiery Annihilation":
+            return False
+        if groups[0]["min"] != 1 or groups[1]["min"] != 0:
+            return False
+        if pending.get("equipment_flow_active"):
+            return True
+        if groups[1]["selected"] != 0:
+            return False
+        if pending.get("equipment_flow_started"):
+            return True
+        pending["equipment_flow_started"] = True
+        pending["equipment_flow_active"] = True
+        token = pending.get("token")
+        match_id = self.__live_match_id
+        obj_by_id = {o.get("instanceId"): o for o in objects}
+        candidates = [t["targetInstanceId"] for t in groups[1]["targets"]
+                      if t.get("legalAction") == "SelectAction_Select"
+                      and obj_by_id.get(t.get("targetInstanceId"), {}).get("controllerSeatId")
+                      not in (None, self.__system_seat_id)]
+        target_id = min(candidates) if candidates else None
+        soak_dir = None
+
+        def valid():
+            return ((self.__pending_target_select or {}).get("token") == token
+                    and self.can_execute_game_action(match_id))
+
+        def finish():
+            if not valid():
+                return
+            current = self.__pending_target_select
+            current["equipment_flow_active"] = False
+            self.__write_optional_target_soak(
+                "equipment_acknowledged" if current["groups"][1]["selected"] else "equipment_not_selected",
+                match_id=match_id, token=token, bundle_dir=soak_dir, target_id=target_id)
+            if current["groups"][1]["selected"]:
+                self.submit_selection(reason="fiery_equipment_submit", expected_match_id=match_id,
+                                      allow_okay_fallback=False)
+            else:
+                self.__target_recovery_exhausted("fiery_equipment_not_selected")
+
+        def flow():
+            nonlocal soak_dir
+            if not valid():
+                return
+            soak_dir = self.__write_optional_target_soak(
+                "equipment_before_scan", match_id=match_id, token=token, target_id=target_id)
+            if not valid():
+                return
+            if target_id is None:
+                finish()
+                return
+            try:
+                found = self.select_opponent_battlefield_permanent(target_id, clicks=1, max_scan_sec=4.0)
+            except Exception as exc:
+                bot_logger.log_error(f"FIERY_EQUIPMENT_SCAN_FAILED: {exc}")
+                found = False
+            bot_logger.log_info(f"FIERY_EQUIPMENT_ATTEMPT: source={source_id} target={target_id} found={found}")
+            self.__write_optional_target_soak(
+                "equipment_after_scan", match_id=match_id, token=token,
+                bundle_dir=soak_dir, target_id=target_id)
+            if not valid():
+                return
+            if not found:
+                finish()
+                return
+            deadline = time.monotonic() + 3.0
+            def wait_for_selection():
+                if not valid():
+                    return
+                current = self.__pending_target_select
+                if current["groups"][1]["selected"] or time.monotonic() >= deadline:
+                    finish()
+                else:
+                    threading.Timer(0.1, wait_for_selection).start()
+            self._dismiss_are_you_sure_if_present(context="FIERY_EQUIPMENT", expected_match_id=match_id)
+            wait_for_selection()
+        threading.Timer(0.8, flow).start()
+        return True
 
     def __get_target_click_offsets(self) -> list[tuple[int, int]]:
         # Small fan of offsets around the calibrated avatar position. Used for
@@ -14676,8 +14946,9 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                             own_creatures.append(int(tid))
                         else:
                             opp_creatures.append(int(tid))
-                    elif tid in player_seats and tid != self.__system_seat_id:
-                        face_legal = True
+                    elif tid in player_seats:
+                        if tid != self.__system_seat_id:
+                            face_legal = True
                     elif obj is None:
                         # Unknown target (player/planeswalker not in objects): do
                         # not force a creature click when a face click may be valid.
@@ -14973,7 +15244,9 @@ class Controller(QuestRerollMixin, ControllerSecondary):
             pending = self.__pending_target_select or {}
             return (pending.get("source_id") == source_id
                     and pending.get("token") == selection_token
-                    and pending.get("creature_target_flow_target") == creature_id)
+                    and pending.get("creature_target_flow_target") == creature_id
+                    and not pending.get("zero_recovery_queued")
+                    and not pending.get("zero_recovery_attempted"))
 
         def _attempt_submit(attempt: int = 0, *, clicked: bool = False,
                             selected_update_seq: int = 0,
@@ -15014,6 +15287,9 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     return
                 self.__write_target_debug_bundle("target_click_ack_timeout")
                 if pending.get("allow_cancel") == "AllowCancel_Abort":
+                    pending["cancel_after_zero_failure"] = True
+                    if self.__target_recovery_exhausted("creature_ack_timeout"):
+                        return
                     if _valid() and self.can_execute_game_action(expected_match_id):
                         try:
                             self.input.tap_escape()
@@ -15029,11 +15305,16 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     # Let a fresh SelectTargetsReq start another flow if Arena
                     # keeps the prompt open after all local attempts.
                     pending["creature_target_flow_active"] = False
+                    self.__target_recovery_exhausted("creature_retries_exhausted")
                 return
             if attempt < 2:
                 threading.Timer(0.9, lambda: _do_click(attempt + 1)).start()
             else:
                 self.__write_target_debug_bundle("target_click_ack_timeout")
+                pending = self.__pending_target_select or {}
+                pending["cancel_after_zero_failure"] = pending.get("allow_cancel") == "AllowCancel_Abort"
+                if self.__target_recovery_exhausted("creature_retries_exhausted"):
+                    return
                 if (self.__pending_target_select or {}).get("allow_cancel") == "AllowCancel_Abort":
                     if _valid() and self.can_execute_game_action(expected_match_id):
                         try:
@@ -15400,6 +15681,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     f"for id={target_id}; leaving chooser open."
                 )
                 self.__write_target_debug_bundle("chooser_target_selection_unconfirmed")
+                self.__target_recovery_exhausted("chooser_ack_timeout")
             elif attempt < 2 and not (self._suppress_selections or self._stop_requested):
                 threading.Timer(1.0, lambda: _do(attempt + 1)).start()
             else:
@@ -15407,6 +15689,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     f"CHOOSER_TARGET: giving up on id={target_id} after {attempt + 1} attempt(s); "
                     "not submitting an unresolved selection."
                 )
+                self.__target_recovery_exhausted("chooser_retries_exhausted")
 
         delay = self.__get_delay_timer_remaining()
         start_delay = 0.8 if delay <= 0.05 else delay + 0.4
@@ -15422,6 +15705,10 @@ class Controller(QuestRerollMixin, ControllerSecondary):
     ) -> None:
         now = time.time()
         if self._suppress_selections or self._stop_requested:
+            return
+        pending = self.__pending_target_select or {}
+        if (pending.get("equipment_flow_active") or pending.get("zero_recovery_queued")
+                or pending.get("zero_recovery_attempted")):
             return
         if source_id is None:
             source_id = -1
@@ -15541,26 +15828,61 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     source_id, own_target, reason, friendly=True
                 )
                 return
+        # GRE distinguishes our player from the opponent. Do not collapse an
+        # own-player-only prompt into the opponent fallback.
+        pending_groups = (self.__pending_target_select or {}).get("groups", [])
+        player_ids = {p.get("systemSeatNumber") for p in
+                      (self.updated_game_state.get_players() or [])} if pending_groups else set()
+        offered_players = {t.get("targetInstanceId") for g in pending_groups for t in g["targets"]
+                           if t.get("legalAction") == "SelectAction_Select"
+                           and t.get("targetInstanceId") in player_ids}
+        own_player = self.__system_seat_id in offered_players and not face_legal
+        if face_legal is False and not own_player:
+            bot_logger.log_info(f"{reason}: no legal player target; preserving the target prompt")
+            self.__target_recovery_exhausted("unsupported_target")
+            return
         self.__last_target_select_source_id = source_id
         self.__last_target_select_ts = now
         self.__update_pending_target_select(source_id)
         selection_token = (self.__pending_target_select or {}).get("token")
-        bot_logger.log_info(f"{reason}: targeting opponent avatar")
+        bot_logger.log_info(f"{reason}: targeting {'own' if own_player else 'opponent'} player avatar")
+        expected_match_id = self.__live_match_id
         self.__record_decision(
             "select_target", "target_face",
-            {"source": source_id, "reason": reason},
+            {"source": source_id, "reason": reason, "own_player": own_player},
         )
 
         def _target_selection_still_valid() -> bool:
-            if self._suppress_selections or self._stop_requested:
+            if not self.can_execute_game_action(expected_match_id):
                 return False
             pending = self.__pending_target_select or {}
-            return pending.get("source_id") == source_id and pending.get("token") == selection_token
+            return (pending.get("source_id") == source_id and pending.get("token") == selection_token
+                    and not pending.get("zero_recovery_queued")
+                    and not pending.get("zero_recovery_attempted"))
+
+        def _player_points():
+            if not own_player:
+                return self.__get_avatar_retry_points()
+            arena = self._arena_region
+            if arena is None:
+                return []
+            ax, ay, aw, ah = arena
+            return [(int(ax + aw * rx), int(ay + ah * ry), f"own_player({rx},{ry})")
+                    for rx, ry in [(0.50, 0.88), (0.46, 0.88), (0.54, 0.88),
+                                   (0.50, 0.82), (0.42, 0.46), (0.58, 0.46), (0.50, 0.52)]]
+
+        def _click_player(x, y, label, tag, *, fast=False):
+            if not _target_selection_still_valid():
+                return
+            if own_player:
+                self._click_abs(x, y, tag.replace("OPPONENT", "OWN"))
+            else:
+                self.__click_opponent_avatar_at_screen(x, y, label, tag, fast=fast)
 
         def _submit_if_still_valid() -> None:
             if not _target_selection_still_valid():
                 return
-            self.submit_selection(reason="target_selection_submit")
+            self.submit_selection(reason="target_selection_submit", expected_match_id=expected_match_id)
 
         def _attempt_submit():
             if not _target_selection_still_valid():
@@ -15588,6 +15910,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     )
                 )
                 self.__write_target_debug_bundle("spell_target_budget_elapsed")
+                self.__target_recovery_exhausted("avatar_budget_exhausted")
                 return
             # Note: do NOT gate on __get_delay_timer_remaining here — that value
             # comes from the last GameStateMessage snapshot and does not tick
@@ -15598,7 +15921,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                 return
             points = pending.get("retry_points")
             if not points:
-                points = self.__get_avatar_retry_points()
+                points = _player_points()
                 pending["retry_points"] = points
                 self.__pending_target_select = pending
             attempts = int(pending.get("attempts", 0))
@@ -15607,6 +15930,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     "Target retry abandoned: candidate points exhausted (attempts={})".format(attempts)
                 )
                 self.__write_target_debug_bundle("spell_target_points_exhausted")
+                self.__target_recovery_exhausted("avatar_points_exhausted")
                 return
             x, y, label = points[attempts]
             pending["attempts"] = attempts + 1
@@ -15616,7 +15940,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     attempts + 1, len(points), label
                 )
             )
-            self.__click_opponent_avatar_at_screen(
+            _click_player(
                 x, y, label, f"SELECT_OPPONENT_AVATAR_RETRY_{attempts + 1}", fast=True
             )
             threading.Timer(0.5, _attempt_submit).start()
@@ -15628,14 +15952,14 @@ class Controller(QuestRerollMixin, ControllerSecondary):
             if _attempt_submit():
                 return
             pending = self.__pending_target_select or {}
-            points = self.__get_avatar_retry_points()
+            points = _player_points()
             pending["retry_points"] = points
             pending["attempts"] = 1
             self.__pending_target_select = pending
             if points:
                 x, y, label = points[0]
-                self.__click_opponent_avatar_at_screen(x, y, label, "SELECT_OPPONENT_AVATAR")
-            else:
+                _click_player(x, y, label, "SELECT_OPPONENT_AVATAR")
+            elif not own_player:
                 self.__click_opponent_avatar_with_offset((0, 0), "SELECT_OPPONENT_AVATAR")
             threading.Timer(0.7, _attempt_submit).start()
             threading.Timer(1.0, _retry_if_needed).start()
@@ -16012,6 +16336,9 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     continue
                 req = message.get("selectTargetsReq", {}) or {}
                 targets = req.get("targets", []) or []
+                self.__remember_target_request(req, message.get("allowCancel"))
+                if self.__try_handle_fiery_equipment():
+                    return
                 if targets:
                     t0 = targets[0]
                     min_t = t0.get("minTargets")
@@ -16026,27 +16353,12 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                         f"SelectTargetsReq details: sourceId={req.get('sourceId')}, min={min_t}, max={max_t}, "
                         f"selected={selected}, targetCount={len(t0.get('targets', []) or [])}, legalTargets=[{legal_desc}]"
                     )
-                    self.__update_pending_target_select(
-                        req.get("sourceId"),
-                        min_t=min_t,
-                        max_t=max_t,
-                        selected=selected,
-                        allow_cancel=message.get("allowCancel"),
-                    )
-                    pending_token = (self.__pending_target_select or {}).get("token")
                     if self.__pending_target_ready_to_submit():
                         # MTGA already has enough targets selected -- e.g. a spell
                         # with a single legal target (Essence Scatter vs the one
                         # creature spell on the stack) is auto-targeted. Just
                         # confirm; clicking again could toggle the target off.
-                        def _submit_if_pending_target_still_matches() -> None:
-                            pending = self.__pending_target_select or {}
-                            if (
-                                pending.get("source_id") == (req.get("sourceId") if req.get("sourceId") is not None else -1)
-                                and pending.get("token") == pending_token
-                            ):
-                                self.submit_selection(reason="target_selection_ready")
-                        threading.Timer(0.2, _submit_if_pending_target_still_matches).start()
+                        self.__schedule_ready_target_submit()
                         return
                 source_id = message.get("selectTargetsReq", {}).get("sourceId")
                 # Two-target pump-fight spells (e.g. Felling Blow): pick a friendly

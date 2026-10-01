@@ -1,14 +1,15 @@
-"""Read-only index of local bot sessions for the audit-logs skill."""
+"""Index local bot sessions and maintain an optional local audit-history CSV."""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import re
 import time
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -18,12 +19,23 @@ GOLD_FARMED = re.compile(r"Gold farmed \(real\): '([^']+)' .*?farmed=(\d+)")
 ACCOUNT_EVENT = re.compile(
     r"(?:SWITCH CHECK \(account='([^']+)'|Quest count confirmed fresh for '([^']+)')"
 )
+OPTIONAL_TARGET_EVENTS = (
+    "FIERY_EQUIPMENT_ATTEMPT", "FIERY_EQUIPMENT_SCAN_FAILED",
+    "SUBMIT_ZERO_ATTEMPT", "SUBMIT_ZERO_FAILED", "SUBMIT_ZERO_CANCELLED",
+    "SUBMIT_ZERO_ACKNOWLEDGED", "SUBMIT_ZERO_UNCONFIRMED",
+    "TARGET_RECOVERY_EXHAUSTED", "OPTIONAL_TARGET_SOAK_FAILED", "OPTIONAL_TARGET_SOAK",
+)
+CONCEDE_INCIDENT_EVENTS = (
+    "CONCEDE_INCIDENT_CREATED", "CONCEDE_INCIDENT_FINISHED", "CONCEDE_INCIDENT_FAILED",
+)
 RELEVANT = (
     "Gold baseline for '", "Gold farmed (real): '", "SWITCH CHECK (account='",
     "Quest count confirmed fresh for '", "STALL_WATCHDOG_TRIGGERED",
     "STALL_CONCEDE", "ResultReason_Concede", "OPP_BATTLEFIELD_ITEM_TIMEOUT",
     "Quest reroll: stale data", "Quest reroll: skipped", "Quest reroll: failed",
     "QUEST_REROLL_CONFIRM", "GOLD_BALANCE_BELOW_BASELINE",
+    *OPTIONAL_TARGET_EVENTS,
+    *CONCEDE_INCIDENT_EVENTS,
 )
 CRITICAL = {
     "stall_concede", "target_scan_timeout", "target_click_missed",
@@ -31,6 +43,64 @@ CRITICAL = {
     "stuck_action", "timer_critical", "exception", "log_line_torn",
     "account_attribution_missing",
 }
+CSV_FIELDS = (
+    "session_id", "date_utc", "started_at_utc", "ended_at_utc", "completed_matches",
+    "wins", "losses", "win_rate", "confirmed_concedes", "concede_attempts",
+    "concede_rate", "concede_rate_status", "provisional", "audited_at_utc",
+)
+
+
+def utc_iso(epoch: float | None) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="seconds") if epoch else ""
+
+
+def update_audit_csv(path: Path, summary: dict) -> None:
+    """Upsert one session, retaining earlier rows when their artefacts rotate away."""
+    window, matches, concede = summary["window"], summary["matches"], summary["concede"]
+    start = window.get("started_at_epoch") or window.get("first_match_start_estimate_epoch")
+    end = window.get("ended_at_epoch") or window.get("last_match_end_epoch")
+    # Missing history must not become a clean zero. Keep the summarizer's
+    # conservative unavailable rate whenever known attempts are unresolved.
+    coverage = list(summary.get("history_coverage", {}).values())
+    first = min((item.get("first_at") or float("inf") for item in coverage), default=float("inf"))
+    last = max((item.get("last_at") or 0 for item in coverage), default=0)
+    complete_history = (first <= window["first_match_start_estimate_epoch"]
+                        and last >= window["last_match_end_epoch"])
+    rate = concede.get("confirmed_rate") if complete_history else None
+    row = {
+        "session_id": summary["session_id"], "date_utc": utc_iso(start)[:10],
+        "started_at_utc": utc_iso(start), "ended_at_utc": utc_iso(end),
+        "completed_matches": matches["completed"], "wins": matches["won"],
+        "losses": matches["lost"], "win_rate": matches["win_rate"],
+        "confirmed_concedes": concede["confirmed_matches"], "concede_attempts": concede["attempts"],
+        "concede_rate": rate, "concede_rate_status": "available" if rate is not None else "unavailable",
+        "provisional": str(bool(window["running"])).lower(), "audited_at_utc": utc_iso(time.time()),
+    }
+    rows = {}
+    if path.exists():
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames != list(CSV_FIELDS):
+                raise ValueError(f"Unexpected audit CSV columns in {path}; existing file left unchanged")
+            rows = {existing["session_id"]: existing for existing in reader}
+    existing = rows.get(row["session_id"])
+    # A repeated audit after log rotation must not erase an already established
+    # rate for the same completed-match sample.
+    if (existing and rate is None and existing["concede_rate_status"] == "available"
+            and int(existing["completed_matches"]) == matches["completed"]):
+        for field in ("concede_rate", "concede_rate_status", "confirmed_concedes", "concede_attempts"):
+            row[field] = existing[field]
+    rows[row["session_id"]] = row
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        with temporary.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+            writer.writeheader()
+            writer.writerows(sorted(rows.values(), key=lambda item: (item["started_at_utc"], item["session_id"])))
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def read_json(path: Path) -> dict:
@@ -40,6 +110,16 @@ def read_json(path: Path) -> dict:
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def concede_incidents(runtime: Path, session_id: str) -> list[dict]:
+    """Index retained bundles even when capture failed or history has rotated."""
+    incidents = []
+    for path in sorted((runtime / "concedes").glob("*/incident.json")):
+        data = read_json(path)
+        if data.get("session_id") == session_id:
+            incidents.append(data | {"_path": str(path.resolve())})
+    return incidents
 
 
 def timestamp(line: str) -> float | None:
@@ -90,8 +170,13 @@ def history_events(runtime: Path, start: float, end: float) -> tuple[list[dict],
         if not path.is_file():
             continue
         first = last = None
+        first_line = last_line = None
         with path.open(encoding="utf-8", errors="replace") as handle:
             for number, line in enumerate(handle, 1):
+                if STAMP.match(line):
+                    if first_line is None:
+                        first_line = line
+                    last_line = line
                 if not any(token in line for token in RELEVANT):
                     continue
                 at = timestamp(line)
@@ -106,7 +191,9 @@ def history_events(runtime: Path, start: float, end: float) -> tuple[list[dict],
                                    "line": number, "text": line.strip()[:650],
                                    "reason_concede": "ResultReason_Concede" in line,
                                    "stall_concede_click": "STALL_CONCEDE" in line and "[CLICK]" in line})
-        coverage[str(path.resolve())] = {"first_relevant_at": first, "last_relevant_at": last}
+        coverage[str(path.resolve())] = {"first_relevant_at": first, "last_relevant_at": last,
+                                       "first_at": timestamp(first_line) if first_line else None,
+                                       "last_at": timestamp(last_line) if last_line else None}
     events.sort(key=lambda event: (event["at"], event["path"], event["line"]))
     return events, coverage
 
@@ -271,6 +358,16 @@ def summarize(folder: Path, records: list[dict], status: dict, runtime: Path) ->
                     "example_record": examples[label]} for label, count in alerts.most_common()],
         "gold": gold_summary(events, status, current, configured, start, end, records),
         "history_coverage": coverage,
+        "concede_incidents": {
+            "retained": concede_incidents(runtime, sid),
+            "events": [event for event in events if event["kind"] in CONCEDE_INCIDENT_EVENTS],
+        },
+        "optional_target_recovery": {
+            "history_available": bool(coverage),
+            "observed_event_counts": dict(Counter(event["kind"] for event in events
+                                                   if event["kind"] in OPTIONAL_TARGET_EVENTS)),
+            "events": [event for event in events if event["kind"] in OPTIONAL_TARGET_EVENTS],
+        },
         "focused_events": [event for event in events if event["kind"] in (
             "OPP_BATTLEFIELD_ITEM_TIMEOUT", "Quest reroll: stale data", "Quest reroll: skipped",
             "Quest reroll: failed", "GOLD_BALANCE_BELOW_BASELINE")][:35],
@@ -280,6 +377,9 @@ def summarize(folder: Path, records: list[dict], status: dict, runtime: Path) ->
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--session", help="Session ID prefix or records directory suffix")
+    parser.add_argument("--csv", type=Path, default=Path(__file__).resolve().parents[4] / "audit-history.csv",
+                        help="Session history CSV (default: gitignored audit-history.csv in project root)")
+    parser.add_argument("--no-csv", action="store_true", help="Read-only summary; do not update CSV")
     parser.add_argument("--runtime-dir", type=Path, default=Path(os.environ.get(
         "MTGA_RUNTIME_DIR", Path(__file__).resolve().parents[4] / "runtime")))
     args = parser.parse_args()
@@ -298,8 +398,15 @@ def main() -> None:
     status = read_json(runtime / "status.json")
     selected = summarize(*groups[index], status, runtime)
     previous = summarize(*groups[index - 1], status, runtime) if index > 0 else None
+    csv_result = {"path": str(args.csv.resolve()), "updated": False}
+    if not args.no_csv:
+        try:
+            update_audit_csv(args.csv, selected)
+            csv_result["updated"] = True
+        except (OSError, ValueError) as exc:
+            csv_result["error"] = str(exc)
     print(json.dumps({"runtime_dir": str(runtime), "selected": selected,
-                      "previous": previous}, indent=2))
+                      "previous": previous, "csv": csv_result}, indent=2))
 
 
 if __name__ == "__main__":

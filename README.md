@@ -342,6 +342,8 @@ The bot maximizes mana usage each turn:
 - Decision recovery is guarded against open payment/selection prompts and resumes safely after modal, stack, or scry interruptions
 - If a target-selection prompt appears during a hand scan or before the first cast click, the cast is deferred without clicking, retrying the sweep, or marking the card unreachable. The target handler resumes decisions after the prompt; a completed scan that cannot find the card still uses the existing 20-second cast suppression.
 - A creature target is clicked again only when a newer Arena target update confirms that no target was selected. A delayed or missing acknowledgement alone does not trigger another click, which could otherwise unselect the target.
+- Fiery Annihilation selects its required creature first, then tries one bounded scan for an opponent-controlled Equipment offered by Arena. If the Equipment cannot be selected, it uses **Submit 0** to skip that optional target. Target recovery also checks for Submit 0 when existing retries or submission attempts fail, provided every required target group is satisfied; it does not wait for the stall-concede deadline. Both own-player and opponent-player targets are checked against Arena's legal choices. Submission clicks must be followed by prompt advancement rather than being treated as proof of success.
+- Submit 0 uses a dedicated color template at **0.85 confidence**, with no Okay or coordinate fallback. **Temporary soak diagnostics (remove after live verification)** save labelled before/after screenshots and target-group state in `runtime/debug/optional-target-soak-*` for Equipment selection and zero submission; the audit index includes their log events and bundle paths.
 - After a two-click cast leaves the card, game state, and cast action unchanged, the bot waits for a known screen blocker to clear, then asks the AI for a fresh decision. This poll stops if the match or game state changes. On a clear screen, the bot checks that the same decision is still active and sends a guarded Escape. If that opens Options, a second Escape closes it. Only a completed Escape permits one fresh cast decision; busy input or lost focus before Escape leaves that retry available. If the follow-up also has no effect, it promptly asks for another decision; if the AI still chooses that card, the bot passes priority without a third click. Failed attempts save screenshots and state under `runtime/debug/`; `tools/analyze_cast_recovery.py` summarizes recovery outcomes from the log
 - Ties between otherwise equal casting plans favor lifegain-payoff creatures, so decks built around gaining life develop toward their game plan sooner
 - Removal only ever targets creatures still on the battlefield and never redirects a harmful spell at your own board when no valid enemy target exists
@@ -553,3 +555,34 @@ future soak runs; keep the regression tests for the confirmed fixes.
 ## See also on
 
 [elitepvpers](https://www.elitepvpers.com/)
+
+### Concede screenshots
+
+Bot-triggered stall and inactivity-timer concedes automatically create an incident
+under `runtime/concedes/` (or `MTGA_RUNTIME_DIR/concedes/`). Each incident contains
+up to two `attempt-N.jpg` images and `incident.json` with the reason, session/match
+IDs, attempt and capture status, and final sequence outcome. The newest 30
+incidents are retained independently of other debug bundles.
+
+Images contain only the verified Arena client area, with solid masks over both
+player-name areas. They fit within 1280?720, preserve aspect ratio, and use JPEG
+quality 80. No original desktop image, player names or raw log excerpts are saved
+in these bundles. Masking supports the normal 16:9 in-match layout; arbitrary
+overlays and other diagnostic files are outside this feature's masking scope.
+Missing windows, unsupported layouts and capture/write failures are recorded
+without blocking concession. Existing capture-backend latency still applies.
+`match_completion_observed` records completion after an attempt, not proof that
+the bot's concede caused the result. Log entries beginning `CONCEDE_INCIDENT_`
+link attempts to their folders; audit summaries also index the retained metadata.
+
+### Audit history CSV
+
+The `audit-logs` summary updates the gitignored `audit-history.csv` in the project
+root, with one row per audited session. It stores UTC dates/timestamps, completed
+match counts, wins/losses, win rate, confirmed concede counts/attempts and concede
+rate for later plotting. Rates are fractions (0–1) using completed matches as the
+denominator. Repeat audits update the session's row; running sessions are marked
+provisional. Unknown concede rates are blank. Previous established rates survive
+log rotation when the completed-match count is unchanged. Historical sessions
+use first/last match times when full session times are unavailable.
+Pass `--no-csv` for a read-only summary or `--csv <path>` for another destination.
