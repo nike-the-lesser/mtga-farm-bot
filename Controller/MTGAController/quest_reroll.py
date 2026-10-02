@@ -63,6 +63,8 @@ class QuestRerollMixin:
 
     def _arm_quest_reroll(self):
         self._quest_reroll_pending = True
+        self._quest_home_failures = 0
+        self._quest_home_reentry_after = 0.0
         self._quest_reroll_floor = self._get_log_size(self._log_path)
         self._quest_reroll_data_floor = None
         self._quest_reroll_unverified_before = None
@@ -145,6 +147,10 @@ class QuestRerollMixin:
             return False
         if self._account_switch_in_progress and self._switch_owner_ident != threading.get_ident():
             return False
+        # Recover rewards before consuming the reroll or seeking fresh Home
+        # data. Otherwise Home-not-visible retries can starve reward handling.
+        if self._dismiss_reward_popup():
+            return False
         if self._quest_reroll_dialog_open:
             try:
                 return self._close_quest_reroll_dialog()
@@ -176,8 +182,7 @@ class QuestRerollMixin:
             if not self._quest_reroll_templates_ready():
                 self._reroll_log("failed", "real Arena UI references are missing")
                 return True
-            if (not self._reroll_can_act() or not self._navigate_to_home()
-                    or not self._quest_reroll_home_visible()):
+            if not self._ensure_quest_reroll_home():
                 self._reroll_log("failed", "Home not verified")
                 # No dialog-opening click was sent. A black login-transition
                 # frame must not consume this account's one allowed reroll.
@@ -393,6 +398,44 @@ class QuestRerollMixin:
 
     def _quest_reroll_home_visible(self):
         return self._reroll_match("home", (0, 0, 240, 150)) is not None
+
+    @serialized_home_navigation
+    def _ensure_quest_reroll_home(self):
+        """Recover a stale Home display with a bounded, verified tab re-entry."""
+        def can_navigate():
+            return (self._reroll_can_act()
+                    and not self._quest_reroll_dialog_open
+                    and (not self._account_switch_in_progress
+                         or self._switch_owner_ident == threading.get_ident()))
+
+        if not can_navigate() or not self._navigate_to_home():
+            return False
+        if self._quest_reroll_home_visible():
+            self._quest_home_failures = 0
+            return True
+        self._quest_home_failures = getattr(self, "_quest_home_failures", 0) + 1
+        now = time.monotonic()
+        if (self._quest_home_failures < 2
+                or now < getattr(self, "_quest_home_reentry_after", 0.0)):
+            return False
+        # A failed Home anchor must not justify blind clicks on loading screens
+        # or overlays. The independent Profile template includes a brightness
+        # guard, and every later input rechecks who owns the screen.
+        self._quest_home_reentry_after = now + 8.0
+        profile = self._reroll_match("profile", (155, 0, 140, 150))
+        if profile is None or not can_navigate():
+            return False
+        bot_logger.log_info("QUEST_HOME_REENTRY: repeated Home recognition failures; trying Profile -> Home.")
+        self._click_abs(*profile, "QUEST_HOME_REENTRY_PROFILE")
+        for _ in range(3):
+            time.sleep(1.0)
+            if not can_navigate():
+                return False
+            if self._navigate_to_home() and self._quest_reroll_home_visible():
+                self._quest_home_failures = 0
+                bot_logger.log_info("QUEST_HOME_REENTRY: Home verified after tab re-entry.")
+                return True
+        return False
 
     def _close_quest_reroll_dialog(self):
         if not self._reroll_can_act():

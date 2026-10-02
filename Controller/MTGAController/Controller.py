@@ -18,6 +18,7 @@ import AI.Utilities.CounterLogic as CounterLogic
 import AI.Utilities.CardInfo as CardInfo
 import AI.Utilities.LifegainLogic as LifegainLogic
 from Controller.MTGAController.LogReader import LogReader
+from Controller.MTGAController.popup_recovery import PopupRecoveryMixin
 from Controller.MTGAController.quest_reroll import (
     QuestRerollMixin, replacement_verified, serialized_home_navigation,
 )
@@ -73,7 +74,7 @@ _MY_TIMER_TYPES = {
 }
 
 
-class Controller(QuestRerollMixin, ControllerSecondary):
+class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
 
     # MTGA holds up to 3 daily quests; completed ones drop out of the list. Used
     # to derive absolute completions (slots - remaining) for the switch decision.
@@ -118,6 +119,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         # with a land play, which kicked off an unpayable cast and stalled the
         # bot on the pay-costs screen).
         self.__decision_exec_lock = threading.Lock()
+        self._init_popup_recovery()
         self.__mulligan_decision_callback = None
         self.__action_success_callback = None
         self.__decision_execution_thread = None
@@ -3836,6 +3838,10 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         on Home (its anchor then matches). Returns True only if Home was reached."""
         if self._stop_requested:
             return False
+        if self._dismiss_reward_popup():
+            # Let the claimed/continued/reconnected screen settle before Home
+            # navigation. The next probe must observe the resulting screen.
+            return False
         arena = self._ensure_arena_region(force_reacquire=True)
         if arena is None:
             return False
@@ -4164,119 +4170,17 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         return self._navigate_starter_deck()
 
     def _dismiss_reward_popup(self) -> bool:
-        """Click 'Claim' on the Starter Deck Duel reward screen.
+        """Yield navigation while a verified reward/continue/disconnect popup owns UI.
 
-        After winning games the event shows a full-window 'Reward' popup with a
-        Claim button; it covers the Play/Events controls, so the queue loop gets
-        stuck retrying navigation forever. This is template-gated (Buttons/claim.png)
-        with screen guards to reject ordinary orange Play buttons.
-
-        The template alone is NOT a sufficient gate: claim.png scores above
-        threshold on the event landing page's orange "Play" button, which lives in
-        the same bottom-right corner -- claim_roi below covers essentially all of
-        _EVENT_PLAY_ROI. That false positive made the bot press Play, which starts
-        the next match immediately with whatever deck is selected, so the queue
-        path that swaps in the quest-matched deck was never reached and the bot
-        kept replaying the first deck it ever picked (observed live: 18 "Reward
-        screen detected" events in a session with zero wins, i.e. no reward screen
-        existed at all). Home's Play button also matches and caused a loop of
-        false claims followed by reroll navigation back to Home. Reject both
-        the bright active Home screen and the event landing page before claiming.
-
-        That cross-check ASSUMES the reward popup is full-window and covers the
-        event Play button, i.e. the two screens are mutually exclusive -- verified
-        from logs, not from a pixel measurement of the popup. If the assumption ever
-        breaks the way the original bug did (event_play.png false-matching a real
-        Claim button), this refuses to claim -- but it does NOT deadlock: the caller
-        falls through to _queue_from_event_landing, which clicks event_play.png at
-        that same false match, i.e. lands on Claim and dismisses the popup anyway.
-        Worst case is one wasted navigation cycle, and _swap_starter_deck_for_quest
-        in between verifies the deck chooser really opened before touching the grid.
+        All landing paths share the same text recognition and input ownership.
+        True includes the persistence wait, so a pending popup cannot fall
+        through into reroll, deck selection, or blind Home clicks.
         """
-        if not self._starter_navigation_may_act():
-            return False
-        claim_btn = os.path.join(self._buttons_dir(), "claim.png")
-        if not os.path.exists(claim_btn):
-            return False
-        runtime_status.set_startup_phase("Checking for reward popups")
-        point = self._locate_image_center_in_scaled_arena_region(
-            claim_btn, "REWARD_CLAIM", rel_region=self._REWARD_CLAIM_ROI,
-            confidence=0.80, timeout=1.5,
-        )
-        if point is None or not self._starter_navigation_may_act():
-            return False
-        # Home's orange Play button also matches claim.png. A bright, active
-        # Home anchor proves normal navigation owns the screen; the brightness
-        # check rejects the dimmed anchor behind a modal reward popup.
-        if self._quest_reroll_home_visible():
-            bot_logger.log_info("Reward claim candidate ignored: Home is visible; continuing queue navigation.")
-            return False
-        # Candidate match -- verify before clicking. Done only now, so the extra
-        # probe costs nothing on the common path where no claim-like button is up.
-        if self._on_starter_event_landing_page("REWARD_CLAIM_EVENT_PLAY_GUARD"):
-            bot_logger.log_info(
-                "Reward claim candidate ignored: the event Play button is visible, so this "
-                "is the event landing page and not a reward popup (clicking would start a "
-                "match with the wrong deck)."
-            )
-            return False
-        if not self._starter_navigation_may_act():
-            return False
-        self._click_abs(point[0], point[1], "REWARD_CLAIM")
-        bot_logger.log_info("Reward screen detected: clicked Claim to continue.")
-        time.sleep(1.0)
-        return True
+        return self._recover_blocking_popup(block_navigation=True)
 
     def _dismiss_match_end_screen(self) -> bool:
-        """Safety net for a DEFEAT/VICTORY result screen the post-match timer
-        failed to dismiss, so the queue loop never stalls on it.
-
-        The full-screen result hides every nav anchor, so detect() returns not-ok
-        -- but so do brief loading transitions. To avoid clicking mid-transition we
-        only act after the screen has stayed unrecognized across several
-        consecutive navigation attempts, then click the continue prompt + center
-        (language-independent, no result-text template needed). Returns True if it
-        clicked, so the caller restarts navigation on the next loop."""
-        if not self._starter_navigation_may_act():
-            self._unknown_screen_strikes = 0
-            return False
-        try:
-            det = self._arena_region_provider.detect(write_debug_on_fail=False)
-        except Exception:
-            det = None
-        if det is not None and det.ok:
-            # Back on a recognizable Arena screen -- let normal navigation proceed.
-            self._unknown_screen_strikes = 0
-            return False
-        # Unrecognized/blank screen. Require persistence so a normal loading
-        # transition is not mistaken for a stuck result screen.
-        self._unknown_screen_strikes = getattr(self, "_unknown_screen_strikes", 0) + 1
-        if self._unknown_screen_strikes < 3:
-            return False
-        arena = det.region if (det is not None and det.region is not None) else self._get_ui_action_arena_region(
-            force_reacquire=True, label="MATCH_END_RECOVER"
-        )
-        if arena is None:
-            return False
-        cx = int(arena[0] + (arena[2] // 2))
-        continue_y = int(arena[1] + (arena[3] * 0.93))
-        center_y = int(arena[1] + (arena[3] // 2))
-        bot_logger.log_info(
-            f"Match-end recovery: screen unrecognized for {self._unknown_screen_strikes} tries; clicking continue to advance."
-        )
-        if focus_mtga_window():
-            time.sleep(0.2)
-        for ty in (continue_y, center_y):
-            if not self._starter_navigation_may_act():
-                break
-            self.input.move_abs(cx, ty)
-            time.sleep(0.25)
-            if not self._starter_navigation_may_act():
-                break
-            self.input.left_click(1)
-            time.sleep(0.5)
-        self._unknown_screen_strikes = 0
-        return True
+        """Recover visible Continue text; unknown screens never justify blind clicks."""
+        return self._dismiss_reward_popup()
 
     def _queue_from_event_landing(self, target_colors: str) -> bool:
         """Re-queue directly from the Starter Deck Duel event landing page.
@@ -4661,14 +4565,6 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         if not self._starter_navigation_may_act():
             return False
 
-        # Safety net: a DEFEAT/VICTORY result screen the post-match timer failed
-        # to dismiss also covers the Play/Events controls. Clear it so the queue
-        # loop never spins forever on a screen that still shows the result.
-        if self._dismiss_match_end_screen():
-            return False
-        if not self._starter_navigation_may_act():
-            return False
-
         # Populate the quest cache the first time we reach navigation (in case the
         # startup pass ran before Home had logged the quests block).
         if not self._cached_quests:
@@ -4985,14 +4881,6 @@ class Controller(QuestRerollMixin, ControllerSecondary):
     # both title positions: the first-time pages indent it past a back arrow, the
     # normal landing page starts flush left.
     _STARTER_TITLE_ROI = (20, 100, 700, 110)
-    # Search area for the reward popup's Claim button, same reference frame.
-    # NOTE: this deliberately overlaps _EVENT_PLAY_ROI above -- both buttons live
-    # in the bottom-right corner and claim.png matches the event Play button, so
-    # _dismiss_reward_popup CANNOT rely on the template alone and cross-checks
-    # _on_starter_event_landing_page before clicking. Keep them as constants so
-    # tests can assert that overlap still holds (tests/test_reward_popup_guard.py).
-    _REWARD_CLAIM_ROI = (1450, 850, 470, 230)
-
     # --- Starter Deck Duel screen identification --------------------------
     #
     # The event has FOUR screens that all look alike to a template matcher: one
@@ -5017,7 +4905,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
     _STARTER_SCREEN_CHOOSER = "chooser"
     _STARTER_SCREEN_UNKNOWN = "unknown"
     # Any screen that is the event's own landing page, i.e. one press away from
-    # queueing. _dismiss_reward_popup must refuse to "claim" on all of these.
+    # queueing. These must stay distinct from reward/continue text.
     _STARTER_LANDING_SCREENS = (
         _STARTER_SCREEN_PLAY, _STARTER_SCREEN_START, _STARTER_SCREEN_CHOOSE_DECK,
     )
@@ -5071,10 +4959,9 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         """True if we are on one of the event's landing pages, i.e. a single click
         in the bottom-right corner would join/queue.
 
-        Used both as the reward-popup guard (claim.png matches those pills, so a
-        blind click there starts a match with the wrong deck) and by the deck-swap
-        flow. Covers the first-time "Start" / "Choose Your Deck" pages too, not
-        just "Play" -- clicking them has the same consequence.
+        Used by queue navigation and the deck-swap flow. Covers the first-time
+        "Start" / "Choose Your Deck" pages too, not just "Play" -- clicking
+        them also changes event/deck selection.
         """
         return self._detect_starter_screen(label) in self._STARTER_LANDING_SCREENS
 
@@ -5968,7 +5855,9 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         deadline = time.monotonic() + self._POST_LOGIN_HOME_READY_TIMEOUT
         while not self._stop_requested:
             try:
-                ready = self._navigate_to_home() and self._quest_reroll_home_visible()
+                # A pending swap dialog must go through reroll cleanup first;
+                # Home recovery cannot navigate while that dialog owns the UI.
+                ready = self._quest_reroll_dialog_open or self._ensure_quest_reroll_home()
             except Exception as exc:
                 ready = False
                 bot_logger.log_error(f"Post-login: Home readiness probe failed: {exc}")
@@ -6123,6 +6012,8 @@ class Controller(QuestRerollMixin, ControllerSecondary):
 
     @serialized_home_navigation
     def start_game_from_home_screen(self):
+        if self._dismiss_reward_popup():
+            return
         if not self.reroll_quest_on_landing():
             return
         # Quests-mode switch decision must reflect THIS account's real quest state
@@ -6330,6 +6221,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         session is starting' an explicit act of the start path, instead of a side
         effect buried in a quest helper -- and makes it a no-op to call twice."""
         self._stop_requested = False
+        self._start_popup_recovery()
         # Nothing is known about what the user (or a previous session) left
         # selected in MTGA, so the first Historic queue of a session must
         # navigate and select explicitly rather than trust the Play button.
@@ -6398,6 +6290,7 @@ class Controller(QuestRerollMixin, ControllerSecondary):
 
     def end_game(self) -> None:
         self._stop_requested = True
+        self._popup_recovery_stop.set()
         self.__clear_cast_ack_attempts("bot_stopped")
         self.__concede_outcome = "stop_requested"
         self.__concede_completed_event.set()
@@ -8819,8 +8712,17 @@ class Controller(QuestRerollMixin, ControllerSecondary):
         force: bool = False,
         expected_match_id: str | None = None,
         allow_okay_fallback: bool = True,
+        expected_pay_costs_ts: float | None = None,
+        pay_costs_retry_attempt: int = 0,
     ) -> bool:
         expected_match_id = expected_match_id or self.__live_match_id
+        is_payment = reason.startswith("pay_costs")
+        if is_payment:
+            if expected_pay_costs_ts is None:
+                expected_pay_costs_ts = self.__pending_pay_costs_ts
+            if (not expected_pay_costs_ts
+                    or self.__pending_pay_costs_ts != expected_pay_costs_ts):
+                return False
         pay_costs_submit_state_id = (
             self.__read_game_state_id() if reason.startswith("pay_costs") else None
         )
@@ -8831,12 +8733,23 @@ class Controller(QuestRerollMixin, ControllerSecondary):
             return False
         if not self.__submit_selection_lock.acquire(blocking=False):
             bot_logger.log_info(f"SubmitSelection skipped (already running). reason={reason}")
+            if is_payment and pay_costs_retry_attempt < 80:
+                # Retry contention for at most 16 seconds. The captured prompt
+                # timestamp prevents a queued retry from paying a later cast.
+                threading.Timer(0.2, lambda: self.submit_selection(
+                    reason=reason, force=force, expected_match_id=expected_match_id,
+                    allow_okay_fallback=allow_okay_fallback,
+                    expected_pay_costs_ts=expected_pay_costs_ts,
+                    pay_costs_retry_attempt=pay_costs_retry_attempt + 1,
+                )).start()
             return False
         target_token = (self.__pending_target_select or {}).get("token")
         target_clicked = False
         try:
             def _still_active() -> bool:
-                return self.can_execute_game_action(expected_match_id)
+                return (self.can_execute_game_action(expected_match_id)
+                        and (not is_payment or
+                             self.__pending_pay_costs_ts == expected_pay_costs_ts))
 
             def _locate_and_click(
                 image_path: str,
@@ -8868,6 +8781,23 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                 target_clicked = True
                 return True
 
+            def _try_auto_pay() -> bool:
+                if not is_payment:
+                    return False
+                image_path = os.path.join(self._buttons_dir(), "auto_pay_text.png")
+                if not os.path.exists(image_path):
+                    return False
+                if not _locate_and_click(
+                    image_path, "PAY_COSTS_AUTO_PAY",
+                    rel_region=(1320, 720, 600, 320), scaled=True,
+                ):
+                    return False
+                self.__last_submit_selection_ts = time.time()
+                self.__pending_pay_costs_submit_state_id = (
+                    pay_costs_submit_state_id if pay_costs_submit_state_id is not None else -1
+                )
+                return True
+
             if not force and not self.__selection_submit_allowed():
                 bot_logger.log_info(f"SubmitSelection skipped (not active). reason={reason}")
                 return False
@@ -8895,6 +8825,8 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                             pay_costs_submit_state_id if pay_costs_submit_state_id is not None else -1
                         )
                     return True
+                if _try_auto_pay():
+                    return True
                 # submit_btn not on screen — try okay_btn as fallback (e.g. combat confirm)
                 if allow_okay_fallback and os.path.exists(okay_img):
                     if _locate_and_click(
@@ -8916,6 +8848,8 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     f"SUBMIT_SELECTION_FAILED: no submit control recognized (reason={reason})"
                 )
                 return False
+            if is_payment:
+                return _try_auto_pay()
             if not _still_active():
                 return False
             if not allow_okay_fallback:
@@ -13532,10 +13466,17 @@ class Controller(QuestRerollMixin, ControllerSecondary):
             bot_logger.log_error(f"Failed to handle SelectNReq: {e}")
 
     def __handle_pay_costs_req(self, line: str) -> None:
+        payment_ts = self.__pending_pay_costs_ts
+        payment_match_id = self.__live_match_id
         try:
             start = line.find("{")
             if start == -1:
-                threading.Timer(0.6, lambda: self.submit_selection(reason="pay_costs_no_payload", force=True)).start()
+                threading.Timer(0.6, lambda: self.submit_selection(
+                    reason="pay_costs_no_payload", force=True,
+                    expected_match_id=payment_match_id,
+                    expected_pay_costs_ts=payment_ts,
+                    allow_okay_fallback=False,
+                )).start()
                 return
             payload = json.loads(line[start:])
             messages = payload.get("greToClientEvent", {}).get("greToClientMessages", [])
@@ -13556,10 +13497,13 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                 max_sel = int(cost_sel.get("maxSel", 0) or 0)
 
                 if not ids or min_sel <= 0:
-                    bot_logger.log_info(
-                        "PAY_COSTS_UNRESOLVED: request has no recognized selectable-card cost; "
-                        "waiting for a confirmed game-state transition."
-                    )
+                    if pay_req.get("manaCost"):
+                        bot_logger.log_info("PayCostsReq mana payment: attempting Submit then Auto Pay.")
+                    else:
+                        bot_logger.log_info(
+                            "PAY_COSTS_UNRESOLVED: request has no recognized selectable-card cost; "
+                            "waiting for a confirmed game-state transition."
+                        )
                     continue
 
                 handled_selection = True
@@ -13683,6 +13627,8 @@ class Controller(QuestRerollMixin, ControllerSecondary):
                     lambda: self.submit_selection(
                         reason="pay_costs_auto_submit", force=True,
                         allow_okay_fallback=False,
+                        expected_match_id=payment_match_id,
+                        expected_pay_costs_ts=payment_ts,
                     ),
                 ).start()
         except Exception as e:

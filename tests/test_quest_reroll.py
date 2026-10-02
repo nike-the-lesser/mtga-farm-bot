@@ -85,6 +85,82 @@ class RerollCase(unittest.TestCase):
         )
 
 
+class HomeReentryTests(RerollCase):
+    def test_repeated_misses_reenter_home_then_reroll_once(self):
+        c = self.c
+        self.append(canSwap=True)
+        c._quest_reroll_home_visible.side_effect = [False, False, True]
+        c._reroll_match = Mock(return_value=(210, 40))
+        c._click_abs.side_effect = lambda x, y, tag: self.append(
+            [quest("replacement", 750)], canSwap=False
+        ) if tag == "QUEST_REROLL_CONFIRM" else None
+        with patch.object(c, "_write_quest_reroll_debug_bundle"):
+            self.assertFalse(c.reroll_quest_on_landing())
+            self.assertTrue(c._quest_reroll_pending)
+            c._reroll_match.assert_not_called()
+            self.assertTrue(c.reroll_quest_on_landing())
+        self.assertEqual(self.tags(), ["QUEST_HOME_REENTRY_PROFILE",
+                                      "QUEST_REROLL_OPEN", "QUEST_REROLL_CONFIRM"])
+        self.assertEqual(c._quest_home_failures, 0)
+
+    def test_failed_reentry_is_bounded_and_has_cooldown(self):
+        c = self.c
+        c._quest_reroll_home_visible.return_value = False
+        c._reroll_match = Mock(return_value=(210, 40))
+        with patch("Controller.MTGAController.quest_reroll.time.monotonic", return_value=100):
+            for _ in range(5):
+                self.assertFalse(c._ensure_quest_reroll_home())
+        self.assertEqual(self.tags(), ["QUEST_HOME_REENTRY_PROFILE"])
+        self.assertEqual(c._navigate_to_home.call_count, 8)
+        with patch("Controller.MTGAController.quest_reroll.time.monotonic", return_value=107.9):
+            self.assertFalse(c._ensure_quest_reroll_home())
+        self.assertEqual(self.tags(), ["QUEST_HOME_REENTRY_PROFILE"])
+        with patch("Controller.MTGAController.quest_reroll.time.monotonic", return_value=108):
+            self.assertFalse(c._ensure_quest_reroll_home())
+        self.assertEqual(self.tags(), ["QUEST_HOME_REENTRY_PROFILE"] * 2)
+        c._arm_quest_reroll()
+        self.assertEqual(c._quest_home_failures, 0)
+        self.assertEqual(c._quest_home_reentry_after, 0)
+
+    def test_missing_profile_does_not_click(self):
+        c = self.c
+        c._quest_reroll_home_visible.return_value = False
+        c._reroll_match = Mock(return_value=None)
+        self.assertFalse(c._ensure_quest_reroll_home())
+        self.assertFalse(c._ensure_quest_reroll_home())
+        c._click_abs.assert_not_called()
+
+    def test_healthy_home_does_not_reenter(self):
+        c = self.c
+        c._reroll_match = Mock()
+        for _ in range(3):
+            self.assertTrue(c._ensure_quest_reroll_home())
+        c._reroll_match.assert_not_called()
+        c._click_abs.assert_not_called()
+
+    def test_match_dialog_stop_and_foreign_switch_block_navigation(self):
+        c = self.c
+        for field, value in (("_stop_requested", True),
+                             ("_quest_reroll_dialog_open", True),
+                             ("_account_switch_in_progress", True)):
+            with self.subTest(field=field), patch.object(c, field, value):
+                self.assertFalse(c._ensure_quest_reroll_home())
+        for state in (BotState.IN_GAME, BotState.FIND_MATCH):
+            c._get_state_from_log.return_value = state
+            self.assertFalse(c._ensure_quest_reroll_home())
+        c._navigate_to_home.assert_not_called()
+
+    def test_stop_after_profile_click_prevents_return_click(self):
+        c = self.c
+        c._quest_reroll_home_visible.return_value = False
+        c._reroll_match = Mock(return_value=(210, 40))
+        c._click_abs.side_effect = lambda *args: setattr(c, "_stop_requested", True)
+        self.assertFalse(c._ensure_quest_reroll_home())
+        self.assertFalse(c._ensure_quest_reroll_home())
+        self.assertEqual(c._navigate_to_home.call_count, 2)
+        self.assertEqual(self.tags(), ["QUEST_HOME_REENTRY_PROFILE"])
+
+
 class SnapshotTests(RerollCase):
     def test_boolean_availability_and_compatibility(self):
         for value in (True, False, None, "true", 1, {}, []):
