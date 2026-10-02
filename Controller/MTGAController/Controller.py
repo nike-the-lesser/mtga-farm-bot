@@ -85,6 +85,7 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
     _HOME_QUEST_CHECK_MAX_ATTEMPTS = 3
     _POST_LOGIN_HOME_READY_TIMEOUT = 20.0
     _STALL_CONCEDE_MAX_ATTEMPTS = 2
+    _READY_TARGET_SUBMIT_MAX_ATTEMPTS = 3
     _OPPONENT_BATTLEFIELD_SCAN_STEP = 70
     _OPPONENT_BATTLEFIELD_SCAN_TIMEOUT = 8.0
     # Class-level fallback so instances built without __init__ (tests use
@@ -14625,20 +14626,40 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
 
     def __schedule_ready_target_submit(self) -> None:
         pending = self.__pending_target_select or {}
-        if pending.get("ready_submit_started"):
+        if (pending.get("ready_submit_started")
+                or pending.get("ready_submit_attempts", 0) >= self._READY_TARGET_SUBMIT_MAX_ATTEMPTS):
             return
         pending["ready_submit_started"] = True
         token = pending.get("token")
         match_id = self.__live_match_id
         def submit():
-            if ((self.__pending_target_select or {}).get("token") == token
+            current = self.__pending_target_select or {}
+            if (current.get("token") == token
                     and self.can_execute_game_action(match_id)
                     and self.__pending_target_ready_to_submit()):
                 if self.__submit_selection_lock.locked():
                     threading.Timer(0.2, submit).start()
                     return
-                if not self.submit_selection(reason="target_selection_ready", expected_match_id=match_id):
+                current["ready_submit_attempts"] = current.get("ready_submit_attempts", 0) + 1
+                if self.submit_selection(reason="target_selection_ready", expected_match_id=match_id):
+                    return
+                current = self.__pending_target_select or {}
+                if current.get("token") != token or not self.can_execute_game_action(match_id):
+                    return
+                if self.__zero_target_submit_eligible():
                     self.__target_recovery_exhausted("ready_submit_failed")
+                    return
+                # A failed search sent no Submit click. Retry required-target
+                # prompts without waiting for another GRE request, which may
+                # never arrive while Arena is waiting for confirmation.
+                if current["ready_submit_attempts"] < self._READY_TARGET_SUBMIT_MAX_ATTEMPTS:
+                    threading.Timer(1.0, submit).start()
+                else:
+                    bot_logger.log_error("TARGET_READY_SUBMIT_EXHAUSTED: required-target submit failed after bounded retries.")
+            elif current.get("token") == token:
+                # Selection changed before the callback ran. A later ready
+                # update may start another flow using the remaining attempts.
+                current.pop("ready_submit_started", None)
         threading.Timer(0.2, submit).start()
 
     def __try_handle_fiery_equipment(self) -> bool:

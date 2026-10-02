@@ -89,6 +89,84 @@ class OptionalTargetRecoveryTest(unittest.TestCase):
     def remember(self, req=None):
         self.c._Controller__remember_target_request(req or fiery_request(), "AllowCancel_Abort")
 
+    def remember_required_ready(self):
+        req = fiery_request()
+        req["targets"] = req["targets"][:1]
+        self.remember(req)
+        return req
+
+    def test_required_ready_submit_retries_a_missed_button_without_new_request(self):
+        req = self.remember_required_ready()
+        self.c.submit_selection.side_effect = [False, True]
+        self.c._Controller__schedule_ready_target_submit()
+        self.run_next()
+        self.assertEqual(self.callbacks[0][0], 1.0)
+        # A duplicate ready update must not start a competing submit flow.
+        self.remember(req)
+        self.c._Controller__schedule_ready_target_submit()
+        self.assertEqual(len(self.callbacks), 1)
+        self.run_next()
+        self.assertEqual(self.c.submit_selection.call_count, 2)
+        self.assertEqual(self.callbacks, [])
+
+    def test_required_ready_submit_retries_are_bounded_across_duplicate_requests(self):
+        req = self.remember_required_ready()
+        self.c.submit_selection.return_value = False
+        self.c._Controller__schedule_ready_target_submit()
+        for _ in range(3):
+            self.run_next()
+            self.remember(req)
+            self.c._Controller__schedule_ready_target_submit()
+        self.assertEqual(self.c.submit_selection.call_count, 3)
+        self.assertEqual(self.callbacks, [])
+        self.c._click_abs.assert_not_called()
+
+    def test_required_ready_retry_stops_after_stop_match_or_stage_change(self):
+        for change in ("stop", "match", "stage"):
+            with self.subTest(change=change):
+                self.callbacks.clear()
+                self.c._stop_requested = False
+                self.c._Controller__pending_target_select = None
+                self.c.can_execute_game_action = lambda match: not self.c._stop_requested
+                req = self.remember_required_ready()
+                self.c.submit_selection.reset_mock()
+                self.c.submit_selection.return_value = False
+                self.c._Controller__schedule_ready_target_submit()
+                self.run_next()
+                if change == "stop":
+                    self.c._stop_requested = True
+                elif change == "match":
+                    self.c.can_execute_game_action = lambda match: False
+                else:
+                    req["targets"][0]["prompt"]["promptId"] += 1
+                    self.remember(req)
+                self.run_next()
+                self.c.submit_selection.assert_called_once()
+                self.assertEqual(self.callbacks, [])
+
+    def test_required_ready_update_can_restart_after_selection_changes(self):
+        req = self.remember_required_ready()
+        self.c._Controller__schedule_ready_target_submit()
+        req["targets"][0]["selectedTargets"] = 0
+        self.remember(req)
+        self.run_next()
+        self.c.submit_selection.assert_not_called()
+        req["targets"][0]["selectedTargets"] = 1
+        self.remember(req)
+        self.c._Controller__schedule_ready_target_submit()
+        self.run_next()
+        self.c.submit_selection.assert_called_once()
+
+    def test_optional_ready_submit_failure_keeps_zero_recovery(self):
+        self.remember()
+        self.c.submit_selection.return_value = False
+        self.c._Controller__schedule_ready_target_submit()
+        self.run_next()
+        self.assertEqual(self.callbacks[0][0], 0.0)
+        self.run_next()
+        self.c._click_abs.assert_called_once_with(3145, 1105, "SUBMIT_ZERO")
+        self.c.submit_selection.assert_called_once()
+
     def test_creature_ack_then_equipment_ack_then_submit(self):
         self.remember()
         self.assertTrue(self.c._Controller__try_handle_fiery_equipment())
