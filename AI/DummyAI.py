@@ -20,6 +20,7 @@ class DummyAI(AIKernel):
         self.__has_land_been_played_this_turn = False
         self.__known_battlefield_zones = set()
         self.__unknown_mana_diagnostics = set()
+        self._unknown_mana_sources = {}
         self.__unsupported_cast_logged = set()
         # AI debug lines go into the shared bot.log; without this assignment
         # _debug silently dropped every message (open() raised AttributeError).
@@ -36,6 +37,7 @@ class DummyAI(AIKernel):
         self.__has_land_been_played_this_turn = False
         self.__known_battlefield_zones = set()
         self.__unknown_mana_diagnostics.clear()
+        self._unknown_mana_sources.clear()
         self.__unsupported_cast_logged.clear()
         self._debug("AI state reset complete")
 
@@ -60,6 +62,9 @@ class DummyAI(AIKernel):
         but only one mana source. Unknown sources can pay generic costs only."""
         mana_colors = set()
         mana_sources = {}  # instanceId -> set of colors
+        # Preserve uncertainty separately from the conservative payment estimate.
+        # This is rebuilt for each board read so resolved/removed sources disappear.
+        self._unknown_mana_sources = {}
         mana_actions = {}
         object_by_id = {
             obj.get("instanceId"): obj for obj in (game_objects or [])
@@ -74,7 +79,7 @@ class DummyAI(AIKernel):
                 if instance_id:
                     if instance_id not in mana_sources:
                         mana_sources[instance_id] = set()
-                    mana_actions[instance_id] = action
+                    mana_actions.setdefault(instance_id, []).append(action)
 
                     # Treasure is a token, so Scryfall's card-by-Arena-ID lookup
                     # cannot identify it. Its available mana action produces one
@@ -113,8 +118,15 @@ class DummyAI(AIKernel):
         # Scryfall metadata miss is treated as generic-only.
         for instance_id, colors in mana_sources.items():
             if not colors:
-                grp_id = inst_id_grp_id_dict.get(instance_id)
-                diagnostic_key = grp_id if grp_id is not None else instance_id
+                actions = mana_actions.get(instance_id, [])
+                grp_id = inst_id_grp_id_dict.get(instance_id) or next(
+                    (a.get("grpId") for a in actions if a.get("grpId")), None)
+                ability_ids = tuple(sorted({a.get("abilityGrpId") for a in actions
+                                            if isinstance(a.get("abilityGrpId"), int)}))
+                self._unknown_mana_sources[instance_id] = {
+                    "status": "unknown", "grpId": grp_id, "abilityGrpIds": ability_ids,
+                }
+                diagnostic_key = (grp_id if grp_id is not None else instance_id, ability_ids)
                 if diagnostic_key not in self.__unknown_mana_diagnostics:
                     self.__unknown_mana_diagnostics.add(diagnostic_key)
                     game_object = object_by_id.get(instance_id)
@@ -130,15 +142,19 @@ class DummyAI(AIKernel):
                         "UNRESOLVED_MANA_DIAGNOSTIC " + json.dumps({
                             "instanceId": instance_id,
                             "grpId": grp_id,
-                            "manaAction": mana_actions.get(instance_id),
+                            "manaAction": actions[-1] if actions else None,
+                            "manaActions": actions,
                             "gameObject": object_details,
+                            "status": "unknown",
+                            "reason": "mana ability and card metadata did not resolve colors",
                             "fallback": "generic-only",
                         }, sort_keys=True, default=str)
                     )
 
         total_sources = len(mana_sources)
         sources = [set(colors) for colors in mana_sources.values() if colors]
-        self._debug(f"Mana sources: {total_sources}, colors available: {mana_colors}")
+        self._debug(f"Mana sources: {total_sources}, colors available: {mana_colors}, "
+                    f"unknown color sources: {len(self._unknown_mana_sources)}")
         return mana_colors, total_sources, sources
 
     def _can_cast_with_mana_cost(self, action_mana_cost, available_colors, total_mana, sources):

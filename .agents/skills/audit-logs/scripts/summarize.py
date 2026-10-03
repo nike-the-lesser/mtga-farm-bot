@@ -48,10 +48,219 @@ CSV_FIELDS = (
     "wins", "losses", "win_rate", "confirmed_concedes", "concede_attempts",
     "concede_rate", "concede_rate_status", "provisional", "audited_at_utc",
 )
+MATCH_CSV_FIELDS = (
+    "session_id", "match_index", "account", "started_at_utc", "ended_at_utc",
+    "result", "deck", "deck_status", "deck_evidence_path", "deck_evidence_line",
+)
+DECK_SELECTED = re.compile(
+    r"Starter: deck (.+?) submitted; event page ready to queue\."
+    r"|(?:Historic|Post-login): deck selected \(([^)]+)\)"
+    r"|(?:Historic|Post-login): deck (.+?) is already the selected deck for account '([^']+)'"
+    r"|(?:Historic|Post-login): deck (.+?) is not on the grid and was the last tile "
+    r"this session selected for account '([^']+)'"
+)
+SWITCH_ACCOUNT = re.compile(r"Switching account to '([^']+)'")
 
 
 def utc_iso(epoch: float | None) -> str:
     return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="seconds") if epoch else ""
+
+
+def update_match_csv(path: Path, summary: dict) -> None:
+    """Persist per-game deck evidence; rotation must not erase a known selection."""
+    rows = {}
+    if path.exists():
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames != list(MATCH_CSV_FIELDS):
+                raise ValueError(f"Unexpected match CSV columns in {path}; existing file left unchanged")
+            rows = {(r["session_id"], r["match_index"]): r for r in reader}
+    for match in summary["match_details"]:
+        evidence = match.get("deck_evidence") or {}
+        row = {
+            "session_id": summary["session_id"], "match_index": str(match["match_index"]),
+            "account": match["account"], "started_at_utc": utc_iso(match["started_at_epoch"]),
+            "ended_at_utc": utc_iso(match["ended_at_epoch"]), "result": match["result"],
+            "deck": match["deck"] or "", "deck_status": match["deck_status"],
+            "deck_evidence_path": evidence.get("path", ""),
+            "deck_evidence_line": evidence.get("line", ""),
+        }
+        key = (row["session_id"], row["match_index"])
+        existing = rows.get(key)
+        if (existing and row["deck_status"] == "unknown" and not evidence and existing["deck"]
+                and all(row[field] == existing[field] for field in
+                        ("account", "started_at_utc", "ended_at_utc", "result"))):
+            for field in ("deck", "deck_status", "deck_evidence_path", "deck_evidence_line"):
+                row[field] = existing[field]
+        rows[key] = row
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        with temporary.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=MATCH_CSV_FIELDS)
+            writer.writeheader()
+            writer.writerows(sorted(rows.values(), key=lambda r: (r["session_id"], int(r["match_index"]))))
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def match_decks(runtime: Path, records: list[dict], accounts: dict, configured: set[str],
+                session_start: float | None) -> list[dict]:
+    """Join logged selections to game starts, never guesses from quest colors.
+
+    Account switches and bot restarts invalidate a carried selection. A pick
+    click without a completed selection also makes the deck uncertain. Later
+    games inherit a selection only within the same uninterrupted account visit.
+    """
+    events = []
+    last_end = max(float(r.get("ended_at_epoch") or 0) for r in records)
+    for path in (runtime / "analysis" / "history.log.1", runtime / "analysis" / "history.log"):
+        if not path.is_file():
+            continue
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for number, line in enumerate(handle, 1):
+                # Bot-authored messages only; RAW payloads are not deck evidence.
+                if "[INFO]" not in line and "[CLICK]" not in line and "=== MTGA Bot Session Started ===" not in line:
+                    continue
+                if not any(token in line for token in (
+                    "deck", "Starter Deck Duel selected.", "STARTER_DECK_PICK_", "Switching account to '",
+                    "Gold baseline for '", "SWITCH CHECK (account='",
+                    "Quest count confirmed fresh for '", "=== MTGA Bot Session Started ===",
+                )):
+                    continue
+                at = timestamp(line)
+                if at is not None and at <= last_end:
+                    events.append({"at": at, "path": str(path.resolve()),
+                                   "line": number, "text": line.strip()})
+    # Stable sort retains file/line order within one timestamp across rotation.
+    events.sort(key=lambda e: e["at"])
+    first_start = min(float(r.get("ended_at_epoch") or 0) - float(r.get("duration_sec") or 0)
+                      for r in records)
+    headers = [e["at"] for e in events if e["at"] <= first_start
+               and "=== MTGA Bot Session Started ===" in e["text"]]
+    # Without a session boundary, do not borrow a deck from an earlier run.
+    lower = session_start if session_start is not None else (max(headers) if headers else first_start)
+    events = [e for e in events if e["at"] >= lower]
+    position = 0
+    active_account = None
+    selected = None
+    uncertain_pick = None
+    starter_context = False
+    previous_end = lower
+    details = []
+    for record in sorted(records, key=lambda r: float(r.get("ended_at_epoch") or 0)):
+        ended = float(record.get("ended_at_epoch") or 0)
+        started = ended - float(record.get("duration_sec") or 0)
+        account = accounts[record["_path"]]
+        while position < len(events) and events[position]["at"] <= started:
+            event = events[position]
+            position += 1
+            text = event["text"]
+            switch = SWITCH_ACCOUNT.search(text)
+            identity = ACCOUNT_EVENT.search(text)
+            baseline = GOLD_BASELINE.search(text)
+            if "=== MTGA Bot Session Started ===" in text or switch:
+                selected = None
+                uncertain_pick = None
+                starter_context = False
+                active_account = canonical(switch.group(1), configured).casefold() if switch else None
+            elif identity or baseline:
+                raw = next(v for v in (identity.groups() if identity else (baseline.group(1),)) if v)
+                new_account = canonical(raw, configured).casefold()
+                if active_account != new_account:
+                    selected = None
+                    uncertain_pick = None
+                active_account = new_account
+            if ("[CLICK]" in text and "STARTER_DECK_PICK_" in text
+                    or "selected the first deck in the list" in text):
+                selected = None
+                uncertain_pick = event
+            if "Starter: Starter Deck Duel selected." in text:
+                starter_context = True
+            elif "Historic:" in text or "Post-login: deck selected" in text:
+                starter_context = False
+            match = DECK_SELECTED.search(text)
+            if match:
+                starter, image, visible, visible_account, remembered, remembered_account = match.groups()
+                if visible_account or remembered_account:
+                    owner = canonical(visible_account or remembered_account, configured).casefold()
+                    if owner != active_account:
+                        selected = None
+                    active_account = owner
+                name = starter or image or visible or remembered
+                # Keep Historic filenames as labels: arbitrary names need not be color codes.
+                if name != "<first deck in list>":
+                    selected = (name, active_account, event, bool(remembered))
+                    uncertain_pick = None
+                else:
+                    selected = None
+                    uncertain_pick = event
+        deck, status, evidence = None, "unknown", None
+        if uncertain_pick:
+            evidence = {"path": uncertain_pick["path"], "line": uncertain_pick["line"],
+                        "at": uncertain_pick["at"]}
+        if selected and account != "unattributed" and selected[1] == account.casefold():
+            deck, _, event, remembered = selected
+            status = "inferred" if remembered or event["at"] < previous_end else "logged_selection"
+            evidence = {"path": event["path"], "line": event["line"], "at": event["at"]}
+        details.append({
+            "match_index": record.get("match_index", len(details) + 1), "record": record["_path"],
+            "account": account, "started_at_epoch": started, "ended_at_epoch": ended,
+            "result": str(record.get("result") or "unknown").lower(),
+            "deck": deck, "deck_status": status, "deck_evidence": evidence,
+            "deck_format": "starter" if starter_context else None,
+        })
+        previous_end = ended
+    infer_starter_decks(runtime, details)
+    return details
+
+
+def infer_starter_decks(runtime: Path, details: list[dict]) -> None:
+    """Infer only uniquely matching Starter lists from a reliably owned saved hand."""
+    if not any(m["deck_format"] == "starter" and not m["deck"] for m in details):
+        return
+    root = Path(__file__).resolve().parents[4]
+    lists = read_json(root / "data" / "starter_decks.json")
+    cards = read_json(root / "data" / "starter_deck_cards.json")
+    by_name = {info.get("name"): info for info in cards.values() if isinstance(info, dict)}
+    codes = {}
+    for name, deck in lists.items():
+        colors = {color for card in deck for color in by_name.get(card, {}).get("colors", [])}
+        code = "".join(color for color in "WUBRG" if color in colors)
+        if len(code) == 2:
+            codes[name] = code
+    candidates = defaultdict(list)
+    for path in sorted((runtime / "debug" / "matches").glob("*/snapshots.jsonl")):
+        try:
+            with path.open(encoding="utf-8") as handle:
+                for number, line in enumerate(handle, 1):
+                    try:
+                        snap = json.loads(line)
+                        at = datetime.fromisoformat(snap["ts"]).timestamp()
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    matching = [m for m in details if m["deck_format"] == "starter" and not m["deck"]
+                                and m["started_at_epoch"] <= at <= m["ended_at_epoch"]]
+                    if len(matching) != 1 or snap.get("seat_unknown") or snap.get("my_seat") not in (1, 2):
+                        continue
+                    names = {card.get("name") for card in snap.get("hand", [])
+                             if isinstance(card, dict) and card.get("name") in by_name}
+                    nonlands = {name for name in names if "Land" not in by_name[name].get("types", [])}
+                    if len(nonlands) < 3:
+                        continue
+                    fits = [name for name, deck in lists.items() if name in codes and names <= set(deck)]
+                    if len(fits) == 1:
+                        candidates[matching[0]["record"]].append((codes[fits[0]], fits[0], path, number, sorted(names)))
+        except OSError:
+            continue
+    for match in details:
+        observations = candidates.get(match["record"], [])
+        if observations and len({item[0] for item in observations}) == 1:
+            code, name, path, number, cards_seen = observations[0]
+            match.update(deck=code, deck_status="inferred", deck_name=name,
+                         deck_evidence={"path": str(path.resolve()), "line": number,
+                                        "source": "starter_hand_match", "cards": cards_seen})
 
 
 def update_audit_csv(path: Path, summary: dict) -> None:
@@ -331,6 +540,7 @@ def summarize(folder: Path, records: list[dict], status: dict, runtime: Path) ->
     unresolved = (any(item["status"] != "confirmed" for item in attempts)
                   or recorded_attempts > len(attempts))
     concede_by_account = Counter(record_accounts[path] for path in confirmed_paths if path in record_accounts)
+    deck_details = match_decks(runtime, records, record_accounts, configured, start)
     return {
         "session_id": sid, "records_dir": str(folder.resolve()),
         "window": {"started_at_epoch": start, "ended_at_epoch": end,
@@ -339,6 +549,8 @@ def summarize(folder: Path, records: list[dict], status: dict, runtime: Path) ->
         "matches": {"total": len(records), "completed": completed, "won": totals["won"],
                     "lost": totals["lost"], "other": len(records) - completed,
                     "win_rate": round(totals["won"] / completed, 4) if completed else None},
+        "match_details": deck_details,
+        "deck_counts": dict(Counter(match["deck"] or "unknown" for match in deck_details)),
         "by_account": {key: {"won": value["won"], "lost": value["lost"],
                              "other": sum(value.values()) - value["won"] - value["lost"],
                              "confirmed_concedes": concede_by_account[key],
@@ -380,6 +592,7 @@ def main() -> None:
     parser.add_argument("--csv", type=Path, default=Path(__file__).resolve().parents[4] / "audit-history.csv",
                         help="Session history CSV (default: gitignored audit-history.csv in project root)")
     parser.add_argument("--no-csv", action="store_true", help="Read-only summary; do not update CSV")
+    parser.add_argument("--matches-csv", type=Path, help="Per-game deck CSV (default: audit-matches.csv beside the session CSV)")
     parser.add_argument("--runtime-dir", type=Path, default=Path(os.environ.get(
         "MTGA_RUNTIME_DIR", Path(__file__).resolve().parents[4] / "runtime")))
     args = parser.parse_args()
@@ -399,14 +612,22 @@ def main() -> None:
     selected = summarize(*groups[index], status, runtime)
     previous = summarize(*groups[index - 1], status, runtime) if index > 0 else None
     csv_result = {"path": str(args.csv.resolve()), "updated": False}
+    match_path = args.matches_csv or args.csv.with_name(
+        "audit-matches.csv" if args.csv.name == "audit-history.csv" else args.csv.stem + "-matches.csv")
+    match_csv_result = {"path": str(match_path.resolve()), "updated": False}
     if not args.no_csv:
         try:
             update_audit_csv(args.csv, selected)
             csv_result["updated"] = True
         except (OSError, ValueError) as exc:
             csv_result["error"] = str(exc)
+        try:
+            update_match_csv(match_path, selected)
+            match_csv_result["updated"] = True
+        except (OSError, ValueError) as exc:
+            match_csv_result["error"] = str(exc)
     print(json.dumps({"runtime_dir": str(runtime), "selected": selected,
-                      "previous": previous, "csv": csv_result}, indent=2))
+                      "previous": previous, "csv": csv_result, "matches_csv": match_csv_result}, indent=2))
 
 
 if __name__ == "__main__":

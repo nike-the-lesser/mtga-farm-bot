@@ -86,8 +86,8 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
     _POST_LOGIN_HOME_READY_TIMEOUT = 20.0
     _STALL_CONCEDE_MAX_ATTEMPTS = 2
     _READY_TARGET_SUBMIT_MAX_ATTEMPTS = 3
-    _OPPONENT_BATTLEFIELD_SCAN_STEP = 70
-    _OPPONENT_BATTLEFIELD_SCAN_TIMEOUT = 8.0
+    _TARGET_SUBMIT_LOCK_WAIT_SEC = 8.0
+    _OPPONENT_BATTLEFIELD_SCAN_TIMEOUT = 4.0
     # Class-level fallback so instances built without __init__ (tests use
     # Controller.__new__) still serialise correctly; __init__ replaces it with a
     # per-instance lock.
@@ -8665,7 +8665,7 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
                 card_id=card_id,
                 p1=scan_p1,
                 p2=scan_p2,
-                step=self._OPPONENT_BATTLEFIELD_SCAN_STEP,
+                step=self.battlefield_scan_step,
                 clicks=clicks,
                 label="OPP_BATTLEFIELD_ITEM",
                 max_scan_sec=(self._OPPONENT_BATTLEFIELD_SCAN_TIMEOUT
@@ -12793,10 +12793,24 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
         except Exception as e:
             bot_logger.log_error(f"Card prompt answer failed: {e}")
 
-    def __click_card_prompt_submit(self) -> None:
+    def __click_card_prompt_submit(self, *, still_active=None) -> None:
         """Press the window's Submit button: template first (it moves with the
         selection count, e.g. "Submit 1"), then the measured position."""
         submit_img = os.path.join(self._buttons_dir(), "submit_btn.png")
+        if still_active is not None:
+            if not still_active():
+                return
+            point = self._locate_image_center_in_scaled_arena_region(
+                submit_img, "CARD_PROMPT_SUBMIT_IMG",
+                rel_region=(1500, 820, 420, 200), confidence=0.80, timeout=1.5,
+            ) if os.path.exists(submit_img) else None
+            if point is None:
+                point, _ = self._map_abs_point_to_arena(
+                    self._CARD_PROMPT_SUBMIT_POINT, label="CARD_PROMPT_SUBMIT"
+                )
+            if still_active():
+                self._click_abs(point[0], point[1], "CARD_PROMPT_SUBMIT")
+            return
         if os.path.exists(submit_img) and self._click_image_in_scaled_arena_region(
             submit_img, "CARD_PROMPT_SUBMIT_IMG",
             rel_region=(1500, 820, 420, 200), confidence=0.80, timeout=1.5,
@@ -12881,6 +12895,149 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
                 return False
         return True
 
+    def __own_graveyard_ids(self) -> set[int]:
+        # get_zone() can return the sole zone even when its owner differs.
+        # Require explicit ownership before routing a choice to our graveyard.
+        return {
+            cid
+            for zone in self.updated_game_state.get_full_state().get("zones", [])
+            if zone.get("type") == "ZoneType_Graveyard"
+            and zone.get("ownerSeatId") == self.__system_seat_id
+            for cid in zone.get("objectInstanceIds", []) or []
+        }
+
+    def __single_graveyard_choice(self, req) -> int | None:
+        contexts = [req.get(key) for key in (
+            "context", "optionContext", "selectionType", "selectionContext", "promptType"
+        )]
+        if (req.get("context") != "SelectionContext_Resolution"
+                and req.get("optionContext") != "OptionContext_Resolution"):
+            return None
+        if any(isinstance(value, str) and any(word in value.lower()
+               for word in ("discard", "sacrif")) for value in contexts):
+            return None
+        if req.get("idType") == "IdType_PromptParameterIndex":
+            return None
+        # Possible future extensions: multi-card choices need selection-count
+        # tracking and acknowledgement; opponent-graveyard choices need explicit
+        # ownership routing and effect-specific ranking. Keep this path scoped
+        # to exactly one card from our own graveyard until those are implemented.
+        if req.get("minSel") != 1 or req.get("maxSel") != 1:
+            return None
+        ids = list(req.get("ids") or [])
+        if not ids or not set(ids).issubset(self.__own_graveyard_ids()):
+            return None
+        # Adapt the legal choices to the shared chooser ranking rather than
+        # introducing card-specific policy or a second ranking implementation.
+        picked = self.__pick_chooser_target({"targets": [{"targets": [
+            {"targetInstanceId": cid, "legalAction": "SelectAction_Select"}
+            for cid in ids
+        ]}]})
+        return picked[0] if picked and not picked[1] else None
+
+    def __graveyard_choice_advanced(self, pending) -> bool:
+        state = self.updated_game_state.get_full_state()
+        if int(state.get("gameStateId") or 0) <= pending["state_id"]:
+            return False
+        if not any(zone.get("type") == "ZoneType_Graveyard"
+                   and zone.get("ownerSeatId") == self.__system_seat_id
+                   for zone in state.get("zones", [])):
+            return False  # A missing zone is not proof that the card moved.
+        if pending["target_id"] not in self.__own_graveyard_ids():
+            return True
+        stack_ids = set(cid for zone in state.get("zones", [])
+                        if zone.get("type") == "ZoneType_Stack"
+                        for cid in zone.get("objectInstanceIds", []) or [])
+        return bool(pending["stack_ids"]
+                    and any(zone.get("type") == "ZoneType_Stack" for zone in state.get("zones", []))
+                    and not stack_ids.intersection(pending["stack_ids"]))
+
+    def __start_graveyard_choice(self, req, target_id) -> None:
+        key = (req.get("sourceId"), tuple(req["ids"]))
+        existing = self.__pending_select_n or {}
+        if existing.get("mode") == "graveyard" and existing.get("choice_key") == key:
+            return  # Repeated requests must not toggle an already clicked card.
+        state = self.updated_game_state.get_full_state()
+        self.__select_n_token_counter += 1
+        pending = {
+            "mode": "graveyard", "choice_key": key, "ids": list(req["ids"]),
+            "token": self.__select_n_token_counter, "target_id": target_id,
+            "ts": time.time(), "state_id": int(state.get("gameStateId") or 0),
+            "stack_ids": list(cid for zone in state.get("zones", [])
+                              if zone.get("type") == "ZoneType_Stack"
+                              for cid in zone.get("objectInstanceIds", []) or []),
+            "clicked": False, "submit_attempts": 0, "exhausted": False,
+        }
+        self.__pending_select_n = pending
+        self.__select_n_in_progress = True
+        self.__select_n_in_progress_since = pending["ts"]
+        match_id = self.__live_match_id
+        self.__record_decision("select_n", "graveyard_chooser", {
+            "ids": pending["ids"], "target": target_id, "min_sel": 1,
+        })
+        bot_logger.log_info(f"GRAVEYARD_CHOICE: selecting one card id={target_id}")
+
+        def active():
+            return (self.__pending_select_n is pending
+                    and self.can_execute_game_action(match_id))
+
+        def fail(reason):
+            if not active() or pending["exhausted"]:
+                return
+            pending["exhausted"] = True
+            bot_logger.log_error(f"GRAVEYARD_CHOICE_UNCONFIRMED: {reason}; keeping prompt active.")
+            self.__write_target_debug_bundle("graveyard_choice_unconfirmed")
+
+        def later(callback):
+            timer = threading.Timer(0.6, callback)
+            timer.daemon = True
+            timer.start()
+
+        def verify():
+            if not active():
+                return
+            if self.__graveyard_choice_advanced(pending):
+                self.__clear_pending_select_n_state("GRAVEYARD_CHOICE_ACKNOWLEDGED: prompt advanced.")
+                return
+            if time.time() - pending["ts"] >= 20.0:
+                fail("no game-state advancement")
+                return
+            # Submit can need a second press after animation. Never re-click the
+            # card once dispatched: that could toggle the selection off.
+            if pending["submit_attempts"] < 2 and (
+                    time.time() - pending.get("submitted_at", 0.0) >= 2.0):
+                pending["submit_attempts"] += 1
+                pending["submitted_at"] = time.time()
+                try:
+                    self.__click_card_prompt_submit(
+                        still_active=lambda: active() and not self.__graveyard_choice_advanced(pending)
+                    )
+                except Exception as exc:
+                    fail(f"submit failed: {exc}")
+                    return
+            later(verify)
+
+        def select(attempt=0):
+            if not active():
+                return
+            if self.__graveyard_choice_advanced(pending):
+                self.__clear_pending_select_n_state("GRAVEYARD_CHOICE_ACKNOWLEDGED: prompt advanced.")
+                return
+            try:
+                if self.select_chooser_card(target_id, clicks=1):
+                    if not active():
+                        return
+                    pending["clicked"] = True
+                    later(verify)
+                elif attempt < 1 and time.time() - pending["ts"] < 12.0:
+                    later(lambda: select(attempt + 1))
+                else:
+                    fail("card hover not found")
+            except Exception as exc:
+                fail(f"selection failed: {exc}")
+
+        later(select)
+
     def __handle_select_n_req(self, line: str) -> None:
         try:
             if self._suppress_selections or self._stop_requested:
@@ -12908,6 +13065,11 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
                 ids = list(req.get("ids", []) or [])
                 if not ids:
                     continue
+                if not message.get("informationalUseOnly"):
+                    graveyard_choice = self.__single_graveyard_choice(req)
+                    if graveyard_choice is not None:
+                        self.__start_graveyard_choice(req, graveyard_choice)
+                        return
                 # Modal "Choose One" from an ability resolution (e.g. Perforating
                 # Artist: "loses 3 life unless sacrifice/discard"). Options are
                 # prompt-parameter indices, not game objects, so the object-based
@@ -14530,6 +14692,24 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
             bot_logger.log_error(f"OPTIONAL_TARGET_SOAK_FAILED: event={event} error={exc}")
             return bundle_dir
 
+    def __target_submit_lock_wait_expired(self, pending, flow, *, waiting=False) -> bool:
+        """Bound lock contention across callbacks, without releasing another owner's lock."""
+        key = f"{flow}_lock_wait_started"
+        exhausted = f"{flow}_lock_wait_exhausted"
+        if pending.get(exhausted):
+            return True
+        if waiting and key not in pending:
+            pending[key] = time.monotonic()
+        if key not in pending or time.monotonic() - pending[key] < self._TARGET_SUBMIT_LOCK_WAIT_SEC:
+            return False
+        pending[exhausted] = True
+        bot_logger.log_error(
+            f"TARGET_SUBMIT_LOCK_WAIT_EXHAUSTED: flow={flow} source={pending.get('source_id')} "
+            f"wait_limit={self._TARGET_SUBMIT_LOCK_WAIT_SEC:.1f}s; leaving prompt for existing recovery"
+        )
+        self.__write_target_debug_bundle("target_submit_lock_wait_timeout")
+        return True
+
     def __target_recovery_exhausted(self, reason: str) -> bool:
         """Final target recovery, called by retry owners, never by the watchdog."""
         pending = self.__pending_target_select or {}
@@ -14554,8 +14734,13 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
                 if current.get("token") == token:
                     current.pop("zero_recovery_queued", None)
                 return
+            if self.__target_submit_lock_wait_expired(current, "zero_recovery"):
+                current.pop("zero_recovery_queued", None)
+                current["zero_recovery_attempted"] = True
+                return
             # A submit operation may still be unwinding its finally block.
             if not self.__submit_selection_lock.acquire(blocking=False):
+                self.__target_submit_lock_wait_expired(current, "zero_recovery", waiting=True)
                 threading.Timer(0.2, recover).start()
                 return
             try:
@@ -14626,7 +14811,7 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
 
     def __schedule_ready_target_submit(self) -> None:
         pending = self.__pending_target_select or {}
-        if (pending.get("ready_submit_started")
+        if (pending.get("ready_submit_started") or pending.get("ready_submit_lock_wait_exhausted")
                 or pending.get("ready_submit_attempts", 0) >= self._READY_TARGET_SUBMIT_MAX_ATTEMPTS):
             return
         pending["ready_submit_started"] = True
@@ -14637,7 +14822,10 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
             if (current.get("token") == token
                     and self.can_execute_game_action(match_id)
                     and self.__pending_target_ready_to_submit()):
-                if self.__submit_selection_lock.locked():
+                busy = self.__submit_selection_lock.locked()
+                if self.__target_submit_lock_wait_expired(current, "ready_submit", waiting=busy):
+                    return
+                if busy:
                     threading.Timer(0.2, submit).start()
                     return
                 current["ready_submit_attempts"] = current.get("ready_submit_attempts", 0) + 1
@@ -16034,6 +16222,14 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
             self.__select_n_in_progress_since = 0.0
             self.__clear_target_wait_if_unblocked()
             return False
+        pending = self.__pending_select_n or {}
+        if pending.get("mode") == "graveyard":
+            if self.__graveyard_choice_advanced(pending):
+                self.__clear_pending_select_n_state("GRAVEYARD_CHOICE_ACKNOWLEDGED: prompt advanced.")
+                return False
+            # Exhausting retries does not dismiss Arena's chooser. Keep ordinary
+            # plays paused until real advancement or the existing stall watchdog.
+            return True
         pending_ids = set()
         stack_ids = set()
         pending_zone = self.updated_game_state.get_zone("ZoneType_Pending")

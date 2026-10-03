@@ -109,6 +109,53 @@ class OptionalTargetRecoveryTest(unittest.TestCase):
         self.assertEqual(self.c.submit_selection.call_count, 2)
         self.assertEqual(self.callbacks, [])
 
+    def test_ready_submit_lock_wait_expires_without_clicking_or_restarting(self):
+        req = self.remember_required_ready()
+        lock = self.c._Controller__submit_selection_lock
+        lock.acquire()
+        self.c._Controller__schedule_ready_target_submit()
+        self.run_next()
+        self.assertEqual(self.callbacks[0][0], 0.2)
+        self.clock += self.c._TARGET_SUBMIT_LOCK_WAIT_SEC
+        self.run_next()
+        self.remember(req)
+        self.c._Controller__schedule_ready_target_submit()
+        self.assertEqual(self.callbacks, [])
+        self.c.submit_selection.assert_not_called()
+        self.assertTrue(lock.locked())
+        self.c._Controller__write_target_debug_bundle.assert_called_once_with(
+            "target_submit_lock_wait_timeout")
+        lock.release()
+
+    def test_ready_submit_resumes_when_lock_is_released_before_deadline(self):
+        self.remember_required_ready()
+        lock = self.c._Controller__submit_selection_lock
+        lock.acquire()
+        self.c._Controller__schedule_ready_target_submit()
+        self.run_next()
+        self.clock += 0.2
+        lock.release()
+        self.run_next()
+        self.c.submit_selection.assert_called_once()
+        self.assertEqual(self.callbacks, [])
+        self.c._Controller__write_target_debug_bundle.assert_not_called()
+
+    def test_zero_recovery_lock_wait_expires_without_releasing_owner_lock(self):
+        self.remember()
+        lock = self.c._Controller__submit_selection_lock
+        lock.acquire()
+        self.assertTrue(self.c._Controller__target_recovery_exhausted("test"))
+        self.run_next()
+        self.clock += self.c._TARGET_SUBMIT_LOCK_WAIT_SEC
+        self.run_next()
+        self.assertFalse(self.c._Controller__target_recovery_exhausted("repeat"))
+        self.assertEqual(self.callbacks, [])
+        self.c._click_abs.assert_not_called()
+        self.assertTrue(lock.locked())
+        self.c._Controller__write_target_debug_bundle.assert_called_once_with(
+            "target_submit_lock_wait_timeout")
+        lock.release()
+
     def test_required_ready_submit_retries_are_bounded_across_duplicate_requests(self):
         req = self.remember_required_ready()
         self.c.submit_selection.return_value = False

@@ -20,6 +20,8 @@ __pycache__/
 runtime/
 audit-history.csv
 audit-history.csv.tmp
+audit-matches.csv
+audit-matches.csv.tmp
 
 # Accounts are user-specific — keep folder structure but ignore contents
 Accounts/*

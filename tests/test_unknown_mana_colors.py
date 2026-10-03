@@ -35,6 +35,7 @@ class UnknownManaColorTest(unittest.TestCase):
         self.assertEqual(colors, {"white", "blue", "black", "red", "green"})
         self.assertEqual(total, 1)
         self.assertEqual(sources, [colors])
+        self.assertEqual(ai._unknown_mana_sources, {})
         self.assertFalse(any("UNRESOLVED_MANA_DIAGNOSTIC" in line for line in debug))
         self.assertTrue(ai._can_cast_with_mana_cost(
             [{"color": ["ManaColor_Blue"], "count": 1}], colors, total, sources
@@ -77,6 +78,31 @@ class UnknownManaColorTest(unittest.TestCase):
         diagnostic = next(line for line in debug if "UNRESOLVED_MANA_DIAGNOSTIC" in line)
         self.assertIn('"abilityGrpId": 1039', diagnostic)
         self.assertIn('"subtypes": ["SubType_Island"]', diagnostic)
+        self.assertIn('"status": "unknown"', diagnostic)
+        self.assertEqual(ai._unknown_mana_sources[12]["abilityGrpIds"], (1039,))
+
+    def test_unknown_diagnostics_keep_distinct_abilities_and_clear_when_resolved(self):
+        ai = DummyAI()
+        debug = []
+        ai._debug = debug.append
+        def action(ability):
+            return {"action": {"actionType": "ActionType_Activate_Mana",
+                               "instanceId": 12, "grpId": 94178, "abilityGrpId": ability}}
+        with patch("AI.DummyAI.CardInfo.get_mana_color_from_ability", return_value=None), \
+             patch("AI.DummyAI.CardInfo.get_land_produced_colors", return_value=set()):
+            ai._get_available_mana_colors([action(1039), action(1040)], {})
+            ai._get_available_mana_colors([action(1039), action(1040)], {})
+        self.assertEqual(ai._unknown_mana_sources[12]["grpId"], 94178)
+        self.assertEqual(ai._unknown_mana_sources[12]["abilityGrpIds"], (1039, 1040))
+        diagnostics = [line for line in debug if "UNRESOLVED_MANA_DIAGNOSTIC" in line]
+        self.assertEqual(len(diagnostics), 1)
+        self.assertIn('"abilityGrpId": 1040', diagnostics[0])
+        with patch("AI.DummyAI.CardInfo.get_mana_color_from_ability", return_value="blue"):
+            colors, total, sources = ai._get_available_mana_colors([action(1039)], {})
+        self.assertEqual(ai._unknown_mana_sources, {})
+        self.assertEqual((colors, total, sources), ({"blue"}, 1, [{"blue"}]))
+        ai.reset()
+        self.assertEqual(ai._unknown_mana_sources, {})
 
 
 if __name__ == "__main__":
