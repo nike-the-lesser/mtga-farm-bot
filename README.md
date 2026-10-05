@@ -1,4 +1,7 @@
 # Burning Lotus Bot
+
+Startup reward recovery requires Claim text, preventing orange Play and Submit Deck buttons from being mistaken for rewards.
+Pending startup/login rerolls are retried before an account switch, including accounts that already met their farming target.
 <img width="429" height="823" alt="githubscreen" src="https://github.com/user-attachments/assets/ac3ec57b-45de-4a22-aebe-0bcb3db90ae0" />
 
 Free, open-source Magic the Gathering Arena (MTGA) bot for automating daily quests, daily wins, and account switching. Burning Lotus runs on Windows, macOS, and Linux without code injection or subscriptions. Built in Python with a graphical UI, no command-line knowledge required.
@@ -37,9 +40,15 @@ Keep the entire MTGA window visible while the bot is running. If the game is mov
 
 Seasonal rewards and other overlays showing **Claim Rewards** or **Click to Continue** are recovered after five seconds without meaningful progress, including during startup and account login. Recovery checks the text even if the log still says matchmaking or gameplay, claims rewards first, and searches again before another click. When an overlay hides the normal navigation anchors, recovery searches within the freshly detected Arena window. A verified disconnect dialog takes priority over rewards behind it: after two minutes without progress, the bot clicks **Reconnect** and checks the screen again before any later action. Continue text uses a 0.70 matching threshold to tolerate its changing background; recovery respects Stop and existing input ownership.
 
-Reward recovery runs before quest reroll and Home navigation. While a verified popup is waiting to be handled, reroll and deck navigation pause. All reward entry points use the same text checks, including buttons that say only **Claim**; orange Play buttons are no longer classified with the generic Claim button template. Unrecognized screens alone no longer trigger blind match-result clicks.
+Reward recovery runs before quest reroll and Home navigation. While a verified popup is waiting to be handled, reroll and deck navigation pause. Text checks include buttons that say only **Claim**. If text recognition misses, recovery waits for a later observation; it never falls back to the generic orange Claim-button shape. After three consecutive unrecognized-screen checks, Starter navigation uses a Continue-position click, followed by a centre click only if a fresh check still reports an unrecognized screen in the same Arena window. A recognized page, a popup, changed or invalid geometry, or a failed check prevents the centre click. Claim, Claim Rewards, Click to Continue and Reconnect text take priority over generic clicks. The fallback rechecks that matchmaking/gameplay has not started before sending input, rejects unsupported or off-screen window geometry, and sends no clicks if window focusing fails on Windows.
 
 During cost payment, the bot looks for **Auto Pay** if Submit is unavailable. If another selection is still using the controller, payment retries for up to 16 seconds while the same payment prompt remains active. Normal play stays paused until the game acknowledges advancement after payment.
+
+Quest reroll searches for the 500 Gold label in one continuous daily-quest area (x=50–910, y=750–960 in the normalized 1920×1080 Arena window). This avoids clipping labels at internal search boundaries while leaving win rewards farther to the right outside the search. The existing matching threshold and brightness checks still apply.
+
+Scry and Surveil keep normal gameplay paused until their central overlay is confirmed closed in two settled observations. Done is located again for each of up to three attempts, with input ownership held across recognition and the press. Surveil's fixed-position fallback requires its visible heading. Missing captures never count as completion. Recovery requires successful window focusing on Windows; Linux and macOS verify the visible overlay without requiring the Windows focus helper. The stall watchdog identifies the pending prompt and allows one final recovery attempt with a five-second grace period before conceding; recovery attempts do not reset the original stall age.
+
+**Temporary Scry/Surveil soak capture:** launch the UI from PowerShell with `$env:MTGA_GROUP_RECOVERY_SOAK = '1'` followed by `.\.venv\Scripts\python.exe ui.py`, then start the bot as usual. This saves before/after Arena frames, search regions, matching scores, intended coordinates and closure results under `runtime/debug/group-soak-*`. Extra capture output is disabled by default. After the soak, close that UI and run `Remove-Item Env:MTGA_GROUP_RECOVERY_SOAK` before restarting normally. Remove the temporary recorder after live verification; keep the recovery and regression tests.
 
 ## Quick Start
 

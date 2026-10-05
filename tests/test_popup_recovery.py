@@ -26,6 +26,7 @@ class PopupRecoveryTests(unittest.TestCase):
         self.c._locate_image_center_in_scaled_arena_region = Mock(return_value=None)
         self.c._click_image_in_scaled_arena_region = Mock(return_value=False)
         self.c._click_abs = Mock()
+        self.c._quest_reroll_home_visible = Mock(return_value=False)
         self.claim = ("POPUP_CLAIM_REWARDS", (1700, 1000), (0, 0, 1920, 1080))
         self.continue_ = ("POPUP_CONTINUE", (960, 1050), (0, 0, 1920, 1080))
         self.c._find_blocking_popup = Mock(return_value=self.claim)
@@ -228,13 +229,176 @@ class PopupRecoveryTests(unittest.TestCase):
         self.assertTrue(self.c._dismiss_reward_popup())
         self.c._click_abs.assert_not_called()
 
-    def test_unrecognized_screen_never_triggers_blind_match_end_clicks(self):
+    def unknown_screen(self):
+        self.c._arena_region_provider.detect = Mock(return_value=ArenaDetectionResult(
+            False, (200, 100, 1920, 1080), "anchor_not_found", "result screen",
+        ))
+        self.c.input.move_abs = Mock()
+        self.c.input.left_click = Mock()
+        self.c._get_ui_action_arena_region = Mock(return_value=None)
+
+    def test_unknown_screen_uses_main_fallback_after_three_misses(self):
+        self.unknown_screen()
         self.c._find_blocking_popup.return_value = None
-        self.c._arena_region_provider.detect = Mock(side_effect=AssertionError("legacy probe"))
-        for _ in range(5):
+        with patch("Controller.MTGAController.Controller.time.sleep"), patch(
+            "Controller.MTGAController.Controller.focus_mtga_window", return_value=True,
+        ):
+            for _ in range(2):
+                self.assertFalse(self.c._dismiss_match_end_screen())
+            self.c.input.left_click.assert_not_called()
+            self.assertTrue(self.c._dismiss_match_end_screen())
+        self.assertEqual([call.args for call in self.c.input.move_abs.call_args_list],
+                         [(1160, 1104), (1160, 640)])
+        self.assertEqual(self.c.input.left_click.call_count, 2)
+        self.assertEqual(self.c._unknown_screen_strikes, 0)
+
+    def test_fallback_prefers_popup_text_and_waits_without_generic_clicks(self):
+        self.unknown_screen()
+        for _ in range(2):
             self.assertFalse(self.c._dismiss_match_end_screen())
+        self.assertTrue(self.c._dismiss_match_end_screen())
         self.c._click_abs.assert_not_called()
-        self.c._arena_region_provider.detect.assert_not_called()
+        self.clock.return_value += 5
+        self.assertTrue(self.c._dismiss_match_end_screen())
+        self.c._click_abs.assert_called_once_with(1700, 1000, "POPUP_CLAIM_REWARDS")
+        self.c.input.left_click.assert_not_called()
+
+    def test_first_fallback_click_stops_when_screen_or_geometry_changes(self):
+        outcomes = (
+            ArenaDetectionResult(True, (200, 100, 1920, 1080), "ok", "Home"),
+            ArenaDetectionResult(True, (200, 100, 1920, 1080), "ok", "event"),
+            ArenaDetectionResult(False, (200, 100, 1200, 1000), "window_wrong_size", "resized"),
+            ArenaDetectionResult(False, (300, 100, 1920, 1080), "anchor_not_found", "moved"),
+            None,
+            OSError("capture failed"),
+        )
+        for outcome in outcomes:
+            with self.subTest(outcome=outcome):
+                self.unknown_screen()
+                initial = self.c._arena_region_provider.detect.return_value
+                self.c._arena_region_provider.detect.side_effect = [initial, outcome]
+                self.c._unknown_screen_strikes = 2
+                self.c._find_blocking_popup.return_value = None
+                with patch("Controller.MTGAController.Controller.time.sleep"), patch(
+                    "Controller.MTGAController.Controller.focus_mtga_window", return_value=True,
+                ):
+                    self.assertTrue(self.c._dismiss_match_end_screen())
+                self.c.input.left_click.assert_called_once_with(1)
+                self.c.input.move_abs.assert_called_once_with(1160, 1104)
+
+    def test_popup_appearing_after_first_fallback_click_blocks_centre_click(self):
+        self.unknown_screen()
+        self.c._unknown_screen_strikes = 2
+        self.c._find_blocking_popup.return_value = None
+        self.c.input.left_click.side_effect = lambda _: setattr(
+            self.c._find_blocking_popup, "return_value", self.claim
+        )
+        with patch("Controller.MTGAController.Controller.time.sleep"), patch(
+            "Controller.MTGAController.Controller.focus_mtga_window", return_value=True,
+        ):
+            self.assertTrue(self.c._dismiss_match_end_screen())
+        self.c.input.left_click.assert_called_once_with(1)
+        self.c._click_abs.assert_not_called()
+
+    def test_fallback_rejects_invalid_geometry_even_with_a_rectangle(self):
+        self.unknown_screen()
+        self.c._find_blocking_popup.return_value = None
+        for code in ("window_wrong_size", "window_off_screen"):
+            with self.subTest(code=code):
+                self.c._unknown_screen_strikes = 2
+                self.c._arena_region_provider.detect.return_value = ArenaDetectionResult(
+                    False, (200, 100, 1200, 1000), code, "rejected geometry",
+                )
+                with patch("Controller.MTGAController.Controller.focus_mtga_window") as focus:
+                    self.assertFalse(self.c._dismiss_match_end_screen())
+                focus.assert_not_called()
+                self.c.input.move_abs.assert_not_called()
+                self.c.input.left_click.assert_not_called()
+                self.assertEqual(self.c._unknown_screen_strikes, 0)
+
+    def test_fallback_failed_windows_focus_never_moves_or_clicks(self):
+        self.unknown_screen()
+        self.c._find_blocking_popup.return_value = None
+        self.c._unknown_screen_strikes = 2
+        with patch("Controller.MTGAController.Controller.sys.platform", "win32"), patch(
+            "Controller.MTGAController.Controller.focus_mtga_window", return_value=False,
+        ):
+            self.assertFalse(self.c._dismiss_match_end_screen())
+        self.c.input.move_abs.assert_not_called()
+        self.c.input.left_click.assert_not_called()
+
+    def test_fallback_non_windows_does_not_require_windows_focus_helper(self):
+        self.unknown_screen()
+        self.c._find_blocking_popup.return_value = None
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform):
+                self.c.input.left_click.reset_mock()
+                self.c._unknown_screen_strikes = 2
+                with patch("Controller.MTGAController.Controller.sys.platform", platform), patch(
+                    "Controller.MTGAController.Controller.focus_mtga_window", return_value=False,
+                ), patch("Controller.MTGAController.Controller.time.sleep"):
+                    self.assertTrue(self.c._dismiss_match_end_screen())
+                self.assertEqual(self.c.input.left_click.call_count, 2)
+
+    def test_fallback_disconnect_wait_does_not_send_generic_clicks(self):
+        self.unknown_screen()
+        self.c._find_blocking_popup.return_value = ("POPUP_RECONNECT", (960, 600), (0, 0, 1920, 1080))
+        for _ in range(3):
+            self.c._dismiss_match_end_screen()
+        self.clock.return_value += 119
+        self.assertTrue(self.c._dismiss_match_end_screen())
+        self.c.input.left_click.assert_not_called()
+        self.c._click_abs.assert_not_called()
+
+    def test_match_transition_during_fallback_focus_prevents_generic_clicks(self):
+        self.unknown_screen()
+        self.c._find_blocking_popup.return_value = None
+        self.c._unknown_screen_strikes = 2
+        def join_match():
+            self.c._get_state_from_log.return_value = BotState.IN_GAME
+            return True
+        with patch("Controller.MTGAController.Controller.time.sleep"), patch(
+            "Controller.MTGAController.Controller.focus_mtga_window", side_effect=join_match,
+        ):
+            self.c._dismiss_match_end_screen()
+        self.c.input.left_click.assert_not_called()
+
+    def test_visible_navigation_resets_unknown_screen_count(self):
+        self.unknown_screen()
+        self.c._unknown_screen_strikes = 2
+        self.c._arena_region_provider.detect.return_value = ArenaDetectionResult(
+            True, (200, 100, 1920, 1080), "ok", "Home",
+        )
+        self.assertFalse(self.c._dismiss_match_end_screen())
+        self.assertEqual(self.c._unknown_screen_strikes, 0)
+        self.c._find_blocking_popup.assert_not_called()
+
+    def test_missing_claim_text_never_uses_ambiguous_button_fallback(self):
+        self.c._find_blocking_popup.return_value = None
+        self.c._locate_image_center_in_scaled_arena_region.return_value = (1700, 1000)
+        self.assertFalse(self.c._dismiss_reward_popup())
+        self.c._click_abs.assert_not_called()
+        self.c._locate_image_center_in_scaled_arena_region.assert_not_called()
+
+    def test_legacy_claim_guard_rejects_home_play_before_reroll(self):
+        self.c._find_blocking_popup.return_value = None
+        self.c._locate_image_center_in_scaled_arena_region.return_value = (1700, 1000)
+        self.c._quest_reroll_home_visible.return_value = True
+        self.c._quest_reroll_pending = True
+        self.c._on_starter_event_landing_page = Mock(return_value=False)
+        self.assertFalse(self.c._dismiss_reward_popup())
+        self.c._click_abs.assert_not_called()
+        self.assertTrue(self.c._quest_reroll_pending)
+
+    def test_text_miss_can_recover_claim_on_a_later_observation(self):
+        self.c._find_blocking_popup.return_value = None
+        self.assertFalse(self.c._dismiss_reward_popup())
+        self.c._find_blocking_popup.return_value = ("POPUP_CLAIM", (1700, 1000), (0, 0, 1920, 1080))
+        self.assertTrue(self.c._dismiss_reward_popup())
+        self.c._click_abs.assert_not_called()
+        self.clock.return_value += 5
+        self.assertTrue(self.c._dismiss_reward_popup())
+        self.c._click_abs.assert_called_once_with(1700, 1000, "POPUP_CLAIM")
 
     def test_navigation_yields_to_a_competing_popup_probe(self):
         with self.c._popup_recovery_lock:
@@ -292,7 +456,7 @@ class PopupRecoveryTests(unittest.TestCase):
             frame[y:y + h, x:x + w] = image
 
         # Ordinary orange pills triggered the old generic Claim matcher.
-        for filename in ("event_play.png", "play_btn.png"):
+        for filename in ("event_play.png", "play_btn.png", "submit_deck.PNG"):
             frame[:] = 0
             paste(filename, 1500, 920)
             self.assertIsNone(Controller._find_blocking_popup(self.c), filename)

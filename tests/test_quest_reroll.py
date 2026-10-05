@@ -86,6 +86,23 @@ class RerollCase(unittest.TestCase):
 
 
 class HomeReentryTests(RerollCase):
+    def test_refresh_reads_response_when_home_navigation_finishes_after_deadline(self):
+        c = self.c
+        c._reroll_match = Mock(return_value=(210, 40))
+        clock = [90.0]
+
+        def navigate():
+            self.append([quest("replacement")], canSwap=False)
+            clock[0] = 101.0
+            return True
+
+        c._navigate_to_home.side_effect = navigate
+        with patch("Controller.MTGAController.quest_reroll.time.monotonic", side_effect=lambda: clock[0]):
+            snapshot = Controller._freshen_quest_reroll_snapshot(c, deadline=100.0)
+        self.assertIsNotNone(snapshot)
+        self.assertFalse(snapshot["canSwap"])
+        self.assertEqual(snapshot["quests"][0]["questId"], "replacement")
+
     def test_repeated_misses_reenter_home_then_reroll_once(self):
         c = self.c
         self.append(canSwap=True)
@@ -508,15 +525,50 @@ class LandingTests(RerollCase):
         c._select_best_quest.assert_not_called()
         c._click_abs.assert_not_called()
 
-    def test_recoverable_reroll_failure_still_selects_a_deck(self):
-        # The post-login routine runs once per login/switch, so a self-healing
-        # reroll failure must not cost the account its deck selection.
+    def test_pending_reroll_failure_defers_deck_selection(self):
         c = self.c
         c._game_mode = "starter"
         c._run_starter_deck_routine = Mock(return_value=True)
         c.reroll_quest_on_landing = Mock(return_value=False)
-        self.assertTrue(c._run_post_login_routine({}, []))
-        c._run_starter_deck_routine.assert_called_once()
+        self.assertFalse(c._run_post_login_routine({}, []))
+        c._run_starter_deck_routine.assert_not_called()
+
+    def test_due_switch_retries_pending_reroll_before_leaving_account(self):
+        c = self.c
+        c._stop_queue_spam = False
+        c._account_switch_due = Mock(return_value=True)
+        c.start_game_from_home_screen = Mock()
+        c._perform_account_switch = Mock()
+        order = []
+
+        def reroll():
+            order.append("reroll")
+            if len(order) == 2:
+                c._quest_reroll_pending = False
+                return True
+            return False
+
+        c.reroll_quest_on_landing = Mock(side_effect=reroll)
+        with patch("Controller.MTGAController.Controller.time.sleep"), patch(
+            "Controller.MTGAController.Controller.threading.Thread"
+        ) as worker:
+            c._queue_spam_loop()
+        self.assertEqual(order, ["reroll", "reroll"])
+        worker.assert_called_once_with(target=c._perform_account_switch, daemon=True)
+        c.start_game_from_home_screen.assert_not_called()
+
+    def test_pending_reroll_blocks_switch_even_when_check_returns_true(self):
+        c = self.c
+        c._stop_queue_spam = False
+        c._account_switch_due = Mock(return_value=True)
+        c.start_game_from_home_screen = Mock()
+        c.reroll_quest_on_landing = Mock(return_value=True)
+        with patch("Controller.MTGAController.Controller.time.sleep", side_effect=lambda _: setattr(
+            c, "_stop_queue_spam", True
+        )), patch("Controller.MTGAController.Controller.threading.Thread") as worker:
+            c._queue_spam_loop()
+        worker.assert_not_called()
+        c.start_game_from_home_screen.assert_not_called()
 
     def test_post_login_skips_deck_and_queue_when_switch_is_due(self):
         c = self.c
@@ -595,6 +647,22 @@ class LandingTests(RerollCase):
 
 class VisionGuardTests(RerollCase):
     @unittest.skipIf(cv2 is None, "OpenCV not installed")
+    def test_partial_progress_ring_still_matches_existing_500_template(self):
+        tile = cv2.imread(str(Path(__file__).parent / "fixtures" / "quest_gold_500_partial.png"))
+        template = cv2.imread(self.c._app_path("assets", "assert", "quest_reroll", "gold_500.png"),
+                              cv2.IMREAD_GRAYSCALE)
+        self.assertIsNotNone(tile)
+        self.assertIsNotNone(template)
+        scores = cv2.matchTemplate(cv2.cvtColor(tile, cv2.COLOR_BGR2GRAY),
+                                   template, cv2.TM_CCOEFF_NORMED)
+        _, score, _, point = cv2.minMaxLoc(scores)
+        self.assertGreater(score, 0.82)
+        x, y = point
+        h, w = template.shape
+        reference = cv2.imread(self.c._app_path("assets", "assert", "quest_reroll", "gold_500.png"))
+        self.assertGreaterEqual(tile[y:y+h, x:x+w].mean(), reference.mean() * 0.75)
+
+    @unittest.skipIf(cv2 is None, "OpenCV not installed")
     def test_live_500_label_is_detected_in_each_daily_quest_slot(self):
         """Replay the real Home reward pixels without accessing the desktop."""
         c = self.c
@@ -615,7 +683,7 @@ class VisionGuardTests(RerollCase):
                     y + pos[1] + template.shape[0] // 2)
 
         c._locate_image_center_in_scaled_arena_region.side_effect = locate
-        for tile_x in (80, 360, 640, 940):
+        for tile_x in (80, 280, 360, 580, 640, 940):
             with self.subTest(tile_x=tile_x):
                 frame[:] = 0
                 frame[810:940, tile_x:tile_x+130] = tile
@@ -626,13 +694,37 @@ class VisionGuardTests(RerollCase):
                     self.assertIsNotNone(point)
                     self.assertAlmostEqual(point[0], tile_x + 62, delta=2)
 
-    def test_leftmost_visual_tile_not_log_order(self):
+    def test_uses_one_continuous_daily_quest_region(self):
         c = self.c
-        c._reroll_match = Mock(side_effect=[None, (540, 900), (830, 900)])
+        c._reroll_match = Mock(return_value=(540, 900))
         self.assertEqual(Controller._find_500_gold_quest_tile(c), (540, 900))
-        self.assertEqual([call.args[1][0] for call in c._reroll_match.call_args_list], [50, 330])
-        self.assertTrue(all(call.kwargs["confidence"] == 0.82
-                            for call in c._reroll_match.call_args_list))
+        c._reroll_match.assert_called_once_with("gold_500", (50, 750, 860, 210), confidence=0.82)
+
+    @unittest.skipIf(cv2 is None, "OpenCV not installed")
+    def test_real_home_label_crossing_old_search_boundary_is_detected(self):
+        from vision.vision import VisionEngine
+        c = self.c
+        crop = cv2.imread(str(Path(__file__).parent / "fixtures" / "quest_gold_500_boundary.png"))
+        self.assertIsNotNone(crop)
+        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        frame[750:960, 50:910] = crop
+        c._vision.capture.return_value = frame
+        matcher = VisionEngine()
+
+        def locate(path, label, *, rel_region, confidence, **kwargs):
+            x, y, w, h = rel_region
+            match = matcher.find_template(frame[y:y+h, x:x+w], path, threshold=confidence)
+            return (x + match.x, y + match.y) if match else None
+
+        c._locate_image_center_in_scaled_arena_region.side_effect = locate
+        path = c._app_path("assets", "assert", "quest_reroll", "gold_500.png")
+        # The same pixels fail in both former neighbouring search regions.
+        self.assertIsNone(matcher.find_template(frame[750:960, 330:630], path, threshold=0.82))
+        self.assertIsNone(matcher.find_template(frame[750:960, 610:910], path, threshold=0.82))
+        point = Controller._find_500_gold_quest_tile(c)
+        self.assertIsNotNone(point)
+        self.assertAlmostEqual(point[0], 647, delta=2)
+        self.assertAlmostEqual(point[1], 905, delta=2)
 
     @unittest.skipIf(cv2 is None, "OpenCV not installed")
     def test_dimmed_control_is_rejected_despite_template_match(self):

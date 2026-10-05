@@ -19,6 +19,7 @@ import AI.Utilities.CardInfo as CardInfo
 import AI.Utilities.LifegainLogic as LifegainLogic
 from Controller.MTGAController.LogReader import LogReader
 from Controller.MTGAController.popup_recovery import PopupRecoveryMixin
+from Controller.MTGAController.group_recovery import GroupRecoveryMixin
 from Controller.MTGAController.quest_reroll import (
     QuestRerollMixin, replacement_verified, serialized_home_navigation,
 )
@@ -74,7 +75,7 @@ _MY_TIMER_TYPES = {
 }
 
 
-class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
+class Controller(GroupRecoveryMixin, PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
 
     # MTGA holds up to 3 daily quests; completed ones drop out of the list. Used
     # to derive absolute completions (slots - remaining) for the switch decision.
@@ -533,6 +534,8 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
         self.__last_modal_choice_ts = 0.0
         self.__last_group_req_ts = 0.0
         self.__group_req_active_until = 0.0
+        self._group_prompt = None
+        self._group_recovery_lock = threading.Lock()
         self.__group_prompt_seq = 0
         self.__group_prompt_match_id = None
         self.__cast_ack_run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
@@ -4171,17 +4174,87 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
         return self._navigate_starter_deck()
 
     def _dismiss_reward_popup(self) -> bool:
-        """Yield navigation while a verified reward/continue/disconnect popup owns UI.
+        """Recover verified popup text; orange button shape is ambiguous.
 
-        All landing paths share the same text recognition and input ownership.
-        True includes the persistence wait, so a pending popup cannot fall
-        through into reroll, deck selection, or blind Home clicks.
+        Includes the persistence wait so navigation yields to a recognized
+        popup. A missing text match leaves recovery to a later observation.
         """
         return self._recover_blocking_popup(block_navigation=True)
 
+    @serialized_home_navigation
     def _dismiss_match_end_screen(self) -> bool:
-        """Recover visible Continue text; unknown screens never justify blind clicks."""
-        return self._dismiss_reward_popup()
+        """After three unknown-screen probes, try popup text then Continue/centre."""
+        if not self._starter_navigation_may_act():
+            self._unknown_screen_strikes = 0
+            return False
+        try:
+            det = self._arena_region_provider.detect(write_debug_on_fail=False)
+        except Exception:
+            det = None
+        if det is not None and det.ok:
+            self._unknown_screen_strikes = 0
+            return False
+        if det is not None and det.code in {"window_wrong_size", "window_off_screen"}:
+            # A rejected rectangle is not an unknown result screen. Do not
+            # bypass the geometry restrictions by using det.region directly.
+            self._unknown_screen_strikes = 0
+            return False
+        self._unknown_screen_strikes = getattr(self, "_unknown_screen_strikes", 0) + 1
+        if self._unknown_screen_strikes < 3:
+            return False
+        # A recognized popup owns recovery, including its persistence wait.
+        # In particular, do not click through a disconnect while Reconnect waits.
+        if self._recover_blocking_popup(block_navigation=True):
+            return True
+        if not self._starter_navigation_may_act():
+            return False
+        arena = det.region if det is not None and det.region is not None else self._get_ui_action_arena_region(
+            force_reacquire=True, label="MATCH_END_RECOVER"
+        )
+        if arena is None:
+            return False
+        if not self.__decision_exec_lock.acquire(False):
+            return True
+        try:
+            with self.input.input_transaction(timeout=0.0) as acquired:
+                if not acquired or not self._starter_navigation_may_act():
+                    return False
+                cx = int(arena[0] + arena[2] // 2)
+                bot_logger.log_info(
+                    f"Match-end recovery: screen unrecognized for {self._unknown_screen_strikes} tries; clicking continue to advance."
+                )
+                focused = focus_mtga_window()
+                if not focused and sys.platform == "win32":
+                    return False
+                if focused:
+                    time.sleep(0.2)
+                for index, ty in enumerate((int(arena[1] + arena[3] * 0.93), int(arena[1] + arena[3] // 2))):
+                    if index:
+                        # The first press may already have dismissed the result.
+                        # Never send the centre press onto a recognized page,
+                        # a popup, or changed/unverifiable window geometry.
+                        try:
+                            after = self._arena_region_provider.detect(write_debug_on_fail=False)
+                        except Exception:
+                            break
+                        if (after is None or after.ok
+                                or after.code != "anchor_not_found"
+                                or after.region != arena):
+                            break
+                        if self._recover_blocking_popup(block_navigation=True):
+                            break
+                    if not self._starter_navigation_may_act():
+                        break
+                    self.input.move_abs(cx, ty)
+                    time.sleep(0.25)
+                    if not self._starter_navigation_may_act():
+                        break
+                    self.input.left_click(1)
+                    time.sleep(0.5)
+                self._unknown_screen_strikes = 0
+                return True
+        finally:
+            self.__decision_exec_lock.release()
 
     def _queue_from_event_landing(self, target_colors: str) -> bool:
         """Re-queue directly from the Starter Deck Duel event landing page.
@@ -4562,6 +4635,11 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
         # A post-match reward popup covers the Play/Events controls; clear it
         # first so navigation is not stuck retrying against a blocked screen.
         if self._dismiss_reward_popup():
+            return False
+        if not self._starter_navigation_may_act():
+            return False
+
+        if self._dismiss_match_end_screen():
             return False
         if not self._starter_navigation_may_act():
             return False
@@ -5872,8 +5950,8 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
         else:
             return False
         if not self.reroll_quest_on_landing():
-            if self._quest_reroll_pending and not self._quest_reroll_home_visible():
-                bot_logger.log_info("Post-login: reroll deferred until Home is visible again.")
+            if self._quest_reroll_pending:
+                bot_logger.log_info("Post-login: reroll still pending; deferring deck selection.")
                 return False
             # This routine runs ONCE per login/switch (_post_login_action_done),
             # so returning False here drops the account's deck selection for good
@@ -7797,7 +7875,7 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
                 if self.__abort_cast_for_target_selection(cast_ack_id, expected_match_id):
                     return False
                 if (not self.can_execute_game_action(expected_match_id)
-                        or time.time() < self.__group_req_active_until):
+                        or self._group_prompt_blocks_gameplay()):
                     break
                 if self.__abort_stale_cast_context(
                     cast_ack_id, card_id, decision_context, "scan_loop", attempt
@@ -8450,7 +8528,7 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
             while current_hovered_id != card_id:
                 if (
                     not self.can_execute_game_action(expected_match_id)
-                    or time.time() < self.__group_req_active_until
+                    or self._group_prompt_blocks_gameplay()
                 ):
                     return False
                 current_x = self.input.position().x
@@ -9426,6 +9504,9 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
         if getattr(self, "_Controller__concession_claimed", False):
             self.__concede_outcome = outcome
             self.__concede_completed_event.set()  # wake a retry; outcome says why.
+        self._clear_group_prompt()
+        self.__group_prompt_seq += 1
+        self.__group_prompt_match_id = None
         self.__retired_match_id = self.__live_match_id or self.__last_seen_match_id
         self.__live_match_id = None
         self.__last_seen_match_id = None
@@ -9482,7 +9563,10 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
             return None
         local_priority = my_seat is not None and turn.get("decisionPlayer") == my_seat
         prompt_kind = None
-        if self.__has_pending_mulligan_state():
+        if getattr(self, "_group_prompt", None) is not None:
+            context = self._group_prompt["context"].lower()
+            prompt_kind = "surveil" if "surveil" in context else "scry" if "scry" in context else "group"
+        elif self.__has_pending_mulligan_state():
             prompt_kind = "mulligan"
         elif self.__pending_card_prompt:
             prompt_kind = str(self.__pending_card_prompt.get("kind") or "card")
@@ -9548,7 +9632,9 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
         except Exception:
             action_keys, zones, zone_objects, players = (), (), (), ()
         prompt_identity = ()
-        if isinstance(self.__pending_card_prompt, dict):
+        if getattr(self, "_group_prompt", None) is not None:
+            prompt_identity = (self._group_prompt["seq"], self._group_prompt["context"])
+        elif isinstance(self.__pending_card_prompt, dict):
             prompt_identity = (
                 self.__pending_card_prompt.get("kind"),
                 self.__pending_card_prompt.get("source_id"),
@@ -9703,6 +9789,11 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
                 )
                 return
             trigger_signature = getattr(self, "_Controller__stall_context_signature", None)
+            if self._group_watchdog_recovery():
+                self.__arm_stall_watchdog_timer(
+                    arm_id, trigger_signature, started_at, expected_match_id, 5.0,
+                )
+                return
             if not self.__claim_concession("stalled_local_context"):
                 if not getattr(self, "_stop_requested", False) and not self.__concession_claimed:
                     self.__arm_stall_watchdog_timer(
@@ -10194,6 +10285,7 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
         self.__clear_cast_ack_attempts("reset_for_new_game")
         self.__group_prompt_seq += 1
         self.__group_prompt_match_id = None
+        self._clear_group_prompt()
         self.__has_mulled_keep = False
         self.__system_seat_id = None
         self.__last_match_won = None
@@ -10263,6 +10355,7 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
         self.__clear_cast_ack_attempts("state_reset")
         self.__group_prompt_seq += 1
         self.__group_prompt_match_id = None
+        self._clear_group_prompt()
         self.__has_mulled_keep = False
         self.__concession_claimed = False
         self.__concession_claim_reason = None
@@ -11215,6 +11308,16 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
             if self._account_switch_in_progress:
                 bot_logger.log_info("Queue spam stopping: account switch in progress.")
                 return
+            # A transient startup/login failure retains this account's reroll.
+            # Resolve it before the switch branch can leave the account, even
+            # when its farming target is already met.
+            if ((self._quest_reroll_pending or self._quest_reroll_dialog_open)
+                    and self._get_state_from_log() not in (BotState.IN_GAME, BotState.FIND_MATCH)):
+                ready = self.reroll_quest_on_landing()
+                if (not ready or self._quest_reroll_pending
+                        or self._quest_reroll_dialog_open):
+                    time.sleep(3.0)
+                    continue
             # `pending` (not just `due`) so a switch DEFERRED because a match was
             # running is actually carried out. The queue loop only ticks between
             # matches, and this branch is what keeps it from queueing while a
@@ -12334,63 +12437,18 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
                 self.__group_prompt_match_id = self.__live_match_id or self.__last_seen_match_id
                 prompt_seq = self.__group_prompt_seq
                 prompt_match_id = self.__group_prompt_match_id
-                # A running decision/cast hand-scan moves the mouse and would
-                # race the Done click. Signal scans to abort and pause new
-                # decisions until the scry resolves.
-                self.__group_req_active_until = now + 6.0
-                bot_logger.log_info(f"GROUP_REQ ({context}): clicking Done (no reordering).")
+                # Keep the modal pending until visual completion, not a timeout.
+                self.__group_req_active_until = 0.0
+                self._group_prompt = {
+                    "seq": prompt_seq, "match_id": prompt_match_id, "context": str(context),
+                    "clicks": 0, "checks": 0, "seen": False, "absent_samples": 0,
+                    "watchdog_used": False, "awaiting_after": False,
+                    "next_check": time.monotonic() + 0.8,
+                }
+                bot_logger.log_info(f"GROUP_REQ ({context}): awaiting verified Done completion.")
                 self.__record_decision("group", "done", {"context": context})
-
-                def _click_done() -> None:
-                    try:
-                        if self._suppress_selections or self._stop_requested:
-                            return
-                        if (
-                            self.__group_prompt_seq != prompt_seq
-                            or self.__group_prompt_match_id != prompt_match_id
-                        ):
-                            return
-                        # Locate the orange "Done" button by template first. The
-                        # button is visually identical in scry and surveil but can
-                        # sit at slightly different heights, so a single fixed pixel
-                        # missed on scry (bot stalled with the prompt still open).
-                        # Template matching over a generous bottom-centre band works
-                        # for both overlays regardless of the exact position.
-                        # Scry's Done button sits ~49px higher than surveil's
-                        # (game-frame y~876 vs ~925); the band spans both. Template
-                        # confirmed to match the real scry overlay at conf ~0.86, so
-                        # 0.78 leaves headroom for the button's pulsing glow.
-                        done_tpl = os.path.join(self._buttons_dir(), "scry_done.png")
-                        if os.path.exists(done_tpl) and self._click_image_in_scaled_arena_region(
-                            done_tpl, "SCRY_DONE", rel_region=(700, 820, 520, 240),
-                            confidence=0.78, timeout=1.5,
-                        ):
-                            bot_logger.log_info("GROUP_REQ Done click: matched scry_done.png template.")
-                            return
-                        # Fallback fixed coordinate (base 1920x1080), measured from
-                        # real captures: scry's Done button centres at (960, 878),
-                        # surveil's ~47px lower at (960, 925). Pick by context so a
-                        # template miss still lands on the right overlay's button.
-                        base_point = (960, 878) if "scry" in str(context or "").lower() else (960, 925)
-                        target, src = self._map_abs_point_to_arena(base_point, label="SCRY_DONE")
-                        bot_logger.log_info(
-                            f"GROUP_REQ Done click (fallback fixed, context={context}): base={base_point} target={target} src={src}"
-                        )
-                        # _click_abs does a proper left_down/hold/left_up press,
-                        # which Unity registers reliably (a bare left_click can be
-                        # dropped).
-                        self._click_abs(int(target[0]), int(target[1]), "SCRY_DONE")
-                    except Exception as e:
-                        bot_logger.log_error(f"GroupReq Done click failed: {e}")
-
-                # Let the scry overlay finish animating in before clicking.
-                threading.Timer(0.8, _click_done).start()
-                # Re-drive the decision once the prompt window clears. MTGA often
-                # does not emit a fresh GameStateMessage after the scry resolves
-                # (the priority window is unchanged), so the decision that
-                # __update_game_state cancelled while the gate was up would never
-                # be re-armed and the bot would idle until the inactivity rope.
-                self.__schedule_group_resume((self.__group_req_active_until - now) + 0.6)
+                self.__update_stall_watchdog()
+                self.__schedule_group_resume(0.8)
                 return
         except Exception as e:
             bot_logger.log_error(f"Failed to handle GroupReq: {e}")
@@ -12519,16 +12577,19 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
         case is a no-op: it only acts when it is unambiguously our clean priority
         with no decision already in flight."""
         try:
-            self.__group_resume_timer = None
             if (
                 self.__group_prompt_seq != prompt_seq
                 or self.__group_prompt_match_id != match_id
+                or (self.__live_match_id or self.__last_seen_match_id) != match_id
             ):
                 return
+            self.__group_resume_timer = None
             if self._stop_requested or self._suppress_selections:
                 return
+            if self._group_prompt is not None and not self._recover_group_prompt():
+                return
             # Still inside the scry/group window (or a new one arrived): wait it out.
-            if time.time() < self.__group_req_active_until:
+            if self._group_prompt_blocks_gameplay():
                 self.__schedule_group_resume(0.6, attempts, prompt_seq, match_id)
                 return
             # A normal GameStateMessage already re-armed a decision: nothing to do.
@@ -13858,7 +13919,7 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
         if self.__decision_exec_lock.locked():
             return False
         # Legitimate waits -- all of these clear by themselves.
-        if time.time() < self.__group_req_active_until:
+        if self._group_prompt_blocks_gameplay():
             return False
         if (
             self.__should_pause_for_targets()
@@ -17582,7 +17643,7 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
         if self.__arm_mulligan_if_needed(turn_info_dict, raw_dict):
             return
 
-        if time.time() < self.__group_req_active_until:
+        if self._group_prompt_blocks_gameplay():
             if self.__decision_execution_thread is not None:
                 self.__decision_execution_thread.cancel()
                 self.__decision_execution_thread = None
@@ -17823,7 +17884,7 @@ class Controller(PopupRecoveryMixin, QuestRerollMixin, ControllerSecondary):
                         # mouse movement raced the pending scry Done click --
                         # observed as the hand-card hover-scan failing outright
                         # ("No hover update before bounds") right after a scry.
-                        if time.time() < self.__group_req_active_until:
+                        if self._group_prompt_blocks_gameplay():
                             bot_logger.log_info(
                                 "Deferring decision; scry/group prompt still active"
                             )

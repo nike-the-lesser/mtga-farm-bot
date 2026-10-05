@@ -60,6 +60,9 @@ def replacement_verified(before, after):
 
 class QuestRerollMixin:
     _QUEST_REROLL_TIMEOUT = 10.0
+    # One continuous daily-quest band in the normalized 1920x1080 frame.
+    # Its right edge excludes daily/weekly win rewards.
+    _QUEST_TILE_ROI = (50, 750, 860, 210)
 
     def _arm_quest_reroll(self):
         self._quest_reroll_pending = True
@@ -325,11 +328,15 @@ class QuestRerollMixin:
             return None
         if deadline is None:
             deadline = time.monotonic() + 8.0
-        while self._reroll_can_act() and time.monotonic() < deadline:
+        # Navigation may finish at the deadline after Arena already wrote its
+        # response. Read it once before applying the polling timeout.
+        while self._reroll_can_act():
             snapshot = self._extract_latest_quest_snapshot(min_offset=self._quest_reroll_floor)
             if snapshot is not None:
                 self.refresh_quests_cache()
                 return snapshot
+            if time.monotonic() >= deadline:
+                break
             time.sleep(0.2)
         return None
 
@@ -369,18 +376,10 @@ class QuestRerollMixin:
         return point
 
     def _find_500_gold_quest_tile(self):
-        # Live Home reward centres in the 1920x1080 frame are about x=142,
-        # 422, 702. Keep the entire reward label inside each band: the old
-        # 150/450/750 starts excluded the first label and split the second.
-        # Win rewards begin around x=940 and remain outside these bands.
-        for x in (50, 330, 610):
-            # The reward emblem is small and has changed slightly between Arena
-            # client releases. Keep this tolerant match within only the three
-            # daily-quest bands; the brightness guard still rejects dimmed UI.
-            point = self._reroll_match("gold_500", (x, 750, 300, 210), confidence=0.82)
-            if point is not None:
-                return point
-        return None
+        # Splitting this area into overlapping bands clipped a live 500 label
+        # at x=608..687 in both neighbouring searches. Keep the full label
+        # searchable regardless of the quest's position within the daily band.
+        return self._reroll_match("gold_500", self._QUEST_TILE_ROI, confidence=0.82)
 
     def _quest_reroll_dialog_visible(self):
         return self._reroll_match("dialog", (760, 390, 420, 140)) is not None
