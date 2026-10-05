@@ -58,7 +58,6 @@ class OptionalTargetRecoveryTest(unittest.TestCase):
         c.input = Mock()
         c._buttons_dir = lambda: "Buttons"
         c._Controller__write_target_debug_bundle = Mock()
-        c._Controller__write_optional_target_soak = Mock(return_value="soak-bundle")
         c._Controller__record_decision = Mock()
         c._Controller__get_delay_timer_remaining = lambda: 0
         c._Controller__resolve_removal_target = lambda source: None
@@ -228,8 +227,6 @@ class OptionalTargetRecoveryTest(unittest.TestCase):
         self.run_next()
         self.c.submit_selection.assert_called_once()
         self.c._click_abs.assert_not_called()
-        events = [call.args[0] for call in self.c._Controller__write_optional_target_soak.call_args_list]
-        self.assertEqual(events, ["equipment_before_scan", "equipment_after_scan", "equipment_acknowledged"])
 
     def test_scan_miss_submits_zero_immediately(self):
         self.remember()
@@ -366,7 +363,6 @@ class OptionalTargetRecoveryTest(unittest.TestCase):
         self.c._Controller__pending_target_select = None
         self.run_next()
         self.c._Controller__write_target_debug_bundle.assert_not_called()
-        self.assertEqual(self.c._Controller__write_optional_target_soak.call_args.args[0], "zero_acknowledged")
 
     def test_absent_button_uses_no_okay_or_coordinate_fallback(self):
         self.remember()

@@ -5944,7 +5944,6 @@ class Controller(GroupRecoveryMixin, PopupRecoveryMixin, QuestRerollMixin, Contr
                 break
             if time.monotonic() >= deadline:
                 bot_logger.log_error("Post-login: Home not visible; deferring reroll and deck selection.")
-                self._write_quest_reroll_debug_bundle("post_login_home_not_ready")
                 return False
             time.sleep(1.0)
         else:
@@ -12442,7 +12441,7 @@ class Controller(GroupRecoveryMixin, PopupRecoveryMixin, QuestRerollMixin, Contr
                 self._group_prompt = {
                     "seq": prompt_seq, "match_id": prompt_match_id, "context": str(context),
                     "clicks": 0, "checks": 0, "seen": False, "absent_samples": 0,
-                    "watchdog_used": False, "awaiting_after": False,
+                    "watchdog_used": False,
                     "next_check": time.monotonic() + 0.8,
                 }
                 bot_logger.log_info(f"GROUP_REQ ({context}): awaiting verified Done completion.")
@@ -14711,48 +14710,6 @@ class Controller(GroupRecoveryMixin, PopupRecoveryMixin, QuestRerollMixin, Contr
             g["min"] == 0 and g["selected"] == 0 for g in groups
         )
 
-    def __write_optional_target_soak(self, event, *, match_id, token,
-                                    bundle_dir=None, target_id=None, point=None):
-        """TEMPORARY SOAK: remove this helper/calls after the next live audits.
-
-        One bundle per Equipment/Submit-0 operation, with labelled before/after
-        screenshots and request state. Diagnostics never authorize input.
-        """
-        try:
-            if bundle_dir is None:
-                stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-                bundle_dir = bot_logger.ensure_debug_dir(f"optional-target-soak-{stamp}")
-            folder = Path(bundle_dir)
-            status = runtime_status.read_status()
-            pending = self.__pending_target_select or {}
-            started = getattr(self, "_Controller__stall_context_started_at", None)
-            payload = {
-                "temporary_soak": True, "event": event,
-                "session_id": status.get("session_id"), "match_id": match_id,
-                "account": getattr(self, "_current_account_screen_name", None),
-                "source_id": pending.get("source_id"), "expected_token": token,
-                "target_id": target_id, "button_point": point,
-                "submit_zero_confidence": 0.85,
-                "captured_at_epoch": time.time(),
-                "stall_age_sec": time.monotonic() - started if started is not None else None,
-                "arena_region": getattr(self, "_arena_region", None),
-                "pending_target_select": pending,
-                "turn_info": self.updated_game_state.get_turn_info() or {},
-            }
-            (folder / f"{event}.json").write_text(
-                json.dumps(payload, indent=2, default=str), encoding="utf-8")
-            vision = getattr(self, "_vision", None)
-            if vision is not None:
-                vision.begin_tick()
-                full = vision.capture(None)
-                vision.save_image(full, str(folder / f"{event}.jpg"))
-            bot_logger.log_info(f"OPTIONAL_TARGET_SOAK: event={event} match={match_id} "
-                                f"token={token} target={target_id} bundle={folder}")
-            return str(folder)
-        except Exception as exc:
-            bot_logger.log_error(f"OPTIONAL_TARGET_SOAK_FAILED: event={event} error={exc}")
-            return bundle_dir
-
     def __target_submit_lock_wait_expired(self, pending, flow, *, waiting=False) -> bool:
         """Bound lock contention across callbacks, without releasing another owner's lock."""
         key = f"{flow}_lock_wait_started"
@@ -14812,8 +14769,6 @@ class Controller(GroupRecoveryMixin, PopupRecoveryMixin, QuestRerollMixin, Contr
                     image_path, "SUBMIT_ZERO", rel_region=(1320, 720, 600, 320),
                     confidence=0.85, timeout=1.0, use_direct=False,
                 )
-                soak_dir = self.__write_optional_target_soak(
-                    "zero_before_click", match_id=match_id, token=token, point=point)
                 current = self.__pending_target_select or {}
                 turn = self.updated_game_state.get_turn_info() or {}
                 local = getattr(self, "_Controller__system_seat_id", None)
@@ -14821,14 +14776,9 @@ class Controller(GroupRecoveryMixin, PopupRecoveryMixin, QuestRerollMixin, Contr
                         or not self.can_execute_game_action(match_id)
                         or turn.get("decisionPlayer") != local
                         or not self.__zero_target_submit_eligible()):
-                    self.__write_optional_target_soak(
-                        "zero_cancelled", match_id=match_id, token=token,
-                        bundle_dir=soak_dir, point=point)
                     return
                 if point is None:
                     bot_logger.log_info(f"SUBMIT_ZERO_FAILED: button absent reason={reason}")
-                    self.__write_optional_target_soak(
-                        "zero_not_found", match_id=match_id, token=token, bundle_dir=soak_dir)
                     self.__write_target_debug_bundle("submit_zero_not_found")
                     if current.get("cancel_after_zero_failure"):
                         self.input.tap_escape()
@@ -14842,19 +14792,14 @@ class Controller(GroupRecoveryMixin, PopupRecoveryMixin, QuestRerollMixin, Contr
             def check_result():
                 current = self.__pending_target_select or {}
                 if not self.can_execute_game_action(match_id):
-                    outcome = "zero_cancelled"
                     bot_logger.log_info(f"SUBMIT_ZERO_CANCELLED: match ended or input stopped reason={reason}")
                 elif current.get("token") != token:
-                    outcome = "zero_acknowledged"
                     bot_logger.log_info(f"SUBMIT_ZERO_ACKNOWLEDGED: reason={reason}")
                 else:
-                    outcome = "zero_unconfirmed"
                     bot_logger.log_error(f"SUBMIT_ZERO_UNCONFIRMED: reason={reason}")
                     self.__write_target_debug_bundle("submit_zero_unconfirmed")
                     if current.get("cancel_after_zero_failure"):
                         self.input.tap_escape()
-                self.__write_optional_target_soak(
-                    outcome, match_id=match_id, token=token, bundle_dir=soak_dir, point=point)
             threading.Timer(3.0, check_result).start()
 
         threading.Timer(0.0, recover).start()
@@ -14941,7 +14886,6 @@ class Controller(GroupRecoveryMixin, PopupRecoveryMixin, QuestRerollMixin, Contr
                       and obj_by_id.get(t.get("targetInstanceId"), {}).get("controllerSeatId")
                       not in (None, self.__system_seat_id)]
         target_id = min(candidates) if candidates else None
-        soak_dir = None
 
         def valid():
             return ((self.__pending_target_select or {}).get("token") == token
@@ -14952,9 +14896,6 @@ class Controller(GroupRecoveryMixin, PopupRecoveryMixin, QuestRerollMixin, Contr
                 return
             current = self.__pending_target_select
             current["equipment_flow_active"] = False
-            self.__write_optional_target_soak(
-                "equipment_acknowledged" if current["groups"][1]["selected"] else "equipment_not_selected",
-                match_id=match_id, token=token, bundle_dir=soak_dir, target_id=target_id)
             if current["groups"][1]["selected"]:
                 self.submit_selection(reason="fiery_equipment_submit", expected_match_id=match_id,
                                       allow_okay_fallback=False)
@@ -14962,11 +14903,6 @@ class Controller(GroupRecoveryMixin, PopupRecoveryMixin, QuestRerollMixin, Contr
                 self.__target_recovery_exhausted("fiery_equipment_not_selected")
 
         def flow():
-            nonlocal soak_dir
-            if not valid():
-                return
-            soak_dir = self.__write_optional_target_soak(
-                "equipment_before_scan", match_id=match_id, token=token, target_id=target_id)
             if not valid():
                 return
             if target_id is None:
@@ -14978,9 +14914,6 @@ class Controller(GroupRecoveryMixin, PopupRecoveryMixin, QuestRerollMixin, Contr
                 bot_logger.log_error(f"FIERY_EQUIPMENT_SCAN_FAILED: {exc}")
                 found = False
             bot_logger.log_info(f"FIERY_EQUIPMENT_ATTEMPT: source={source_id} target={target_id} found={found}")
-            self.__write_optional_target_soak(
-                "equipment_after_scan", match_id=match_id, token=token,
-                bundle_dir=soak_dir, target_id=target_id)
             if not valid():
                 return
             if not found:

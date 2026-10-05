@@ -339,13 +339,6 @@ class GroupRecoveryTest(unittest.TestCase):
                 self.assertFalse(c._group_prompt_blocks_gameplay())
                 c._Controller__invoke_decision_callback.assert_called_once_with("group/scry resume")
 
-    def test_normal_runs_do_not_write_soak_evidence(self):
-        c = self._open_surveillance()
-        with mock.patch.dict(os.environ, {"MTGA_GROUP_RECOVERY_SOAK": "0"}), \
-             mock.patch("Controller.MTGAController.group_recovery.ensure_runtime_subdir") as folder:
-            c._record_group_soak(c._group_prompt, "before", object(), {})
-        folder.assert_not_called()
-
     def test_watchdog_defers_once_without_resetting_original_deadline(self):
         c = self._open_surveillance()
         c._Controller__auto_concede_stalled_matches = True
@@ -384,22 +377,6 @@ class GroupRecoveryTest(unittest.TestCase):
         c.reset_for_new_game()
         self.assertFalse(c._group_prompt_blocks_gameplay())
 
-    def test_soak_saves_before_and_after_with_click_and_result(self):
-        from pathlib import Path
-        c = self._open_surveillance()
-        c._vision = mock.Mock()
-        with tempfile.TemporaryDirectory() as tmp, \
-             mock.patch.dict(os.environ, {"MTGA_GROUP_RECOVERY_SOAK": "1"}), \
-             mock.patch("Controller.MTGAController.group_recovery.ensure_runtime_subdir", return_value=Path(tmp)):
-            self._check_group(("open", (960, 925), object(), {"done_score": .86}))
-            self._check_group(("absent", None, object(), {}))
-            entries = [json.loads(line) for line in (Path(tmp) / "observations.jsonl").read_text().splitlines()]
-            before = next(e for e in entries if e["stage"] == "before")
-            after = next(e for e in entries if e["stage"] == "after")
-            self.assertEqual(before["point"], [960, 925])
-            self.assertEqual(before["done_score"], .86)
-            self.assertEqual(after["state"], "absent")
-            self.assertIn("screenshot", after)
 
 
 class GroupOverlayRecognitionTest(unittest.TestCase):

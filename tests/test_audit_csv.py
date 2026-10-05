@@ -23,6 +23,25 @@ def summary(session="session-1", complete=True):
     }
 
 
+class AuditHistoryTests(unittest.TestCase):
+    def test_optional_target_history_remains_available_without_capture_bundles(self):
+        lines = [
+            "[2026-10-01 12:00:00.000] [INFO] FIERY_EQUIPMENT_ATTEMPT: target=287 found=True",
+            "[2026-10-01 12:00:01.000] [INFO] SUBMIT_ZERO_ATTEMPT: source=303",
+            "[2026-10-01 12:00:02.000] [INFO] SUBMIT_ZERO_ACKNOWLEDGED: prompt advanced",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            (runtime / "analysis").mkdir()
+            (runtime / "analysis/history.log").write_text("\n".join(lines), encoding="utf-8")
+            events, coverage = audit.history_events(
+                runtime, audit.timestamp(lines[0]), audit.timestamp(lines[-1]))
+            self.assertEqual([event["kind"] for event in events], [
+                "FIERY_EQUIPMENT_ATTEMPT", "SUBMIT_ZERO_ATTEMPT", "SUBMIT_ZERO_ACKNOWLEDGED"])
+            self.assertEqual(events[-1]["line"], 3)
+            self.assertTrue(coverage)
+
+
 class AuditCSVTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

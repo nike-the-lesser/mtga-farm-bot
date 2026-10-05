@@ -211,11 +211,9 @@ class PopupRecoveryTests(unittest.TestCase):
     def test_direct_reroll_checks_rewards_before_consuming_pending_reroll(self):
         self.c._quest_reroll_pending = True
         self.c._extract_latest_quest_snapshot = Mock()
-        self.c._write_quest_reroll_debug_bundle = Mock()
         self.assertFalse(self.c.reroll_quest_on_landing())
         self.assertTrue(self.c._quest_reroll_pending)
         self.c._extract_latest_quest_snapshot.assert_not_called()
-        self.c._write_quest_reroll_debug_bundle.assert_not_called()
         self.clock.return_value += 5
         self.assertFalse(self.c.reroll_quest_on_landing())
         self.c._click_abs.assert_called_once_with(1700, 1000, "POPUP_CLAIM_REWARDS")

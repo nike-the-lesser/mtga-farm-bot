@@ -58,15 +58,8 @@ class SessionWatchdogStallTests(unittest.TestCase):
         }
         self.assertIsNone(_detect_stuck_reason(status, self.thresholds))
 
-    def test_overnight_failure_signatures(self):
-        # TEMPORARY SOAK: remove with the session_watchdog investigation signals.
+    def test_failure_signatures(self):
         examples = {
-            "STALL_WATCHDOG_TRIGGERED: priorityPlayer=2": "stall_concede",
-            "OPP_BATTLEFIELD_ITEM_TIMEOUT: card 316": "target_scan_timeout",
-            "CREATURE_TARGET click: id=316 side=enemy found=False attempt=0": "target_click_missed",
-            "Quest reroll: stale data (no response).": "quest_no_fresh_data",
-            "Quest reroll: skipped (tile missing).": "quest_tile_missed",
-            "Quest reroll: failed (dialog missing).": "quest_reroll_failed",
             "Combat recovery exhausted attempts.": "combat_recovery_failed",
             "COMBAT_RECOVERY_ATTEMPT: 1/2 forcing all_attack": None,
             "SUBMIT_SELECTION_FAILED: no submit control recognized (reason=spell)": "submit_failed",
@@ -79,7 +72,7 @@ class SessionWatchdogStallTests(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertEqual(_classify_line(line), expected)
 
-    def test_match_record_keeps_canonical_account_for_soak_attribution(self):
+    def test_match_record_keeps_canonical_account(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             state = {"match": {"count": 0, "alerts": {}, "stalled": False, "session_dir": ""}}
@@ -100,7 +93,7 @@ class SessionWatchdogStallTests(unittest.TestCase):
             self.assertEqual(record["schema_version"], 2)
             self.assertNotIn("account_attribution_missing", record["alerts"])
 
-    def test_missing_match_account_emits_soak_signal(self):
+    def test_missing_match_account_remains_unknown(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             state = {"match": {"count": 0, "alerts": {}, "stalled": False, "session_dir": ""}}
@@ -115,11 +108,7 @@ class SessionWatchdogStallTests(unittest.TestCase):
 
             record = json.loads((root / "match-0001.json").read_text(encoding="utf-8"))
             self.assertIsNone(record["account"])
-            self.assertEqual(record["alerts"]["account_attribution_missing"], 1)
-            self.assertEqual(
-                _classify_line("MATCH_ACCOUNT_UNATTRIBUTED: session=session match=1"),
-                "account_attribution_missing",
-            )
+            self.assertEqual(record["alerts"], {})
 
     @patch("tools.session_watchdog.time.time", return_value=1000.0)
     def test_stall_is_ignored_without_local_priority(self, _time):

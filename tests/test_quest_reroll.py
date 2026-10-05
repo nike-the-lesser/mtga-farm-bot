@@ -65,24 +65,6 @@ class RerollCase(unittest.TestCase):
     def tags(self):
         return [call.args[2] for call in self.c._click_abs.call_args_list]
 
-    def test_reroll_failure_bundle_saves_state_log_and_screenshot(self):
-        bundle = Path(self.directory.name) / "quest-reroll-test"
-        bundle.mkdir()
-        self.c._state_tracker.get_tail = Mock(return_value="recent quest log")
-        self.c._vision.capture.return_value = "screen"
-
-        with patch(
-            "Controller.MTGAController.quest_reroll.bot_logger.ensure_debug_dir",
-            return_value=str(bundle),
-        ):
-            self.c._write_quest_reroll_debug_bundle("home_not_verified")
-
-        state = json.loads((bundle / "quest_reroll_state.json").read_text(encoding="utf-8"))
-        self.assertEqual(state["reason"], "home_not_verified")
-        self.assertEqual((bundle / "log_tail.txt").read_text(encoding="utf-8"), "recent quest log")
-        self.c._vision.save_image.assert_called_once_with(
-            "screen", str(bundle / "full_screen.jpg")
-        )
 
 
 class HomeReentryTests(RerollCase):
@@ -111,11 +93,10 @@ class HomeReentryTests(RerollCase):
         c._click_abs.side_effect = lambda x, y, tag: self.append(
             [quest("replacement", 750)], canSwap=False
         ) if tag == "QUEST_REROLL_CONFIRM" else None
-        with patch.object(c, "_write_quest_reroll_debug_bundle"):
-            self.assertFalse(c.reroll_quest_on_landing())
-            self.assertTrue(c._quest_reroll_pending)
-            c._reroll_match.assert_not_called()
-            self.assertTrue(c.reroll_quest_on_landing())
+        self.assertFalse(c.reroll_quest_on_landing())
+        self.assertTrue(c._quest_reroll_pending)
+        c._reroll_match.assert_not_called()
+        self.assertTrue(c.reroll_quest_on_landing())
         self.assertEqual(self.tags(), ["QUEST_HOME_REENTRY_PROFILE",
                                       "QUEST_REROLL_OPEN", "QUEST_REROLL_CONFIRM"])
         self.assertEqual(c._quest_home_failures, 0)
@@ -407,16 +388,13 @@ class LandingTests(RerollCase):
         self.assertIn("QUEST_REROLL_CONFIRM", self.tags())
 
     def test_black_home_defers_one_shot_and_next_landing_submits_once(self):
-        # TEMPORARY SOAK DIAGNOSTIC: retain until the overnight reroll run is reviewed.
         c = self.c
         c._arm_quest_reroll()
         self.append(canSwap=True)
         c._navigate_to_home.side_effect = [False, True]
-        with patch.object(c, "_write_quest_reroll_debug_bundle") as bundle:
-            self.assertFalse(c.reroll_quest_on_landing())
-            self.assertTrue(c._quest_reroll_pending)
-            self.assertEqual(self.tags(), [])
-            bundle.assert_called_once_with("home_not_verified")
+        self.assertFalse(c.reroll_quest_on_landing())
+        self.assertTrue(c._quest_reroll_pending)
+        self.assertEqual(self.tags(), [])
         self.assertTrue(c.reroll_quest_on_landing())
         self.assertEqual(self.tags().count("QUEST_REROLL_CONFIRM"), 1)
         self.assertFalse(c._quest_reroll_pending)
@@ -424,18 +402,15 @@ class LandingTests(RerollCase):
         self.assertEqual(self.tags().count("QUEST_REROLL_CONFIRM"), 1)
 
     def test_post_login_black_home_does_not_select_deck(self):
-        # TEMPORARY SOAK DIAGNOSTIC: retain until the overnight reroll run is reviewed.
         c = self.c
         c._POST_LOGIN_HOME_READY_TIMEOUT = 0
         c._navigate_to_home.return_value = False
         c._game_mode = "starter"
         c._run_starter_deck_routine = Mock(return_value=True)
-        with patch.object(c, "_write_quest_reroll_debug_bundle") as bundle:
-            self.assertFalse(c._run_post_login_routine({}, []))
+        self.assertFalse(c._run_post_login_routine({}, []))
         c._run_starter_deck_routine.assert_not_called()
         c._click_abs.assert_not_called()
         self.assertTrue(c._quest_reroll_pending)
-        bundle.assert_called_once_with("post_login_home_not_ready")
 
     def test_navigation_probe_error_before_dialog_keeps_reroll_pending(self):
         c = self.c

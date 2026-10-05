@@ -1,12 +1,9 @@
-"""Verified Scry/Surveil completion; optional, temporary soak evidence."""
-import json
+"""Verified Scry/Surveil completion."""
 import os
 import sys
-import threading
 import time
 
 import bot_logger
-from runtime_paths import ensure_runtime_subdir
 from vision.window_locator import focus_mtga_window
 
 
@@ -69,32 +66,6 @@ class GroupRecoveryMixin:
             return "open", point, frame, details
         return "absent", None, frame, details
 
-    def _record_group_soak(self, prompt, stage, frame, details):
-        # No extra capture or disk output during ordinary runs.
-        if os.environ.get("MTGA_GROUP_RECOVERY_SOAK") != "1":
-            return
-        try:
-            folder = prompt.get("soak_dir")
-            if folder is None:
-                folder = ensure_runtime_subdir(
-                    "debug", f"group-soak-{time.time_ns()}-{prompt['seq']}"
-                )
-                prompt["soak_dir"] = folder
-            number = prompt.get("soak_samples", 0) + 1
-            prompt["soak_samples"] = number
-            entry = {"at_epoch": time.time(), "stage": stage,
-                     "match_id": prompt["match_id"], "prompt_seq": prompt["seq"],
-                     "context": prompt["context"],
-                     "attempts": prompt["clicks"], **details}
-            if frame is not None:
-                name = f"{number:02d}-{stage}.png"
-                self._vision.save_image(frame, str(folder / name))
-                entry["screenshot"] = name
-            with (folder / "observations.jsonl").open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(entry) + "\n")
-        except Exception as exc:
-            bot_logger.log_error(f"GROUP_SOAK capture failed: {exc}")
-
     def _recover_group_prompt(self):
         """One observation/press, then a timer allows animation to settle."""
         prompt = getattr(self, "_group_prompt", None)
@@ -126,10 +97,6 @@ class GroupRecoveryMixin:
                     if not self._group_prompt_may_act(prompt):
                         return False
                     prompt["checks"] += 1
-                    details["state"] = state
-                    stage = "after" if prompt["awaiting_after"] else "check"
-                    prompt["awaiting_after"] = False
-                    self._record_group_soak(prompt, stage, frame, details)
                     if state == "absent" and prompt["seen"]:
                         prompt["absent_samples"] += 1
                         if prompt["absent_samples"] >= 2:
@@ -143,13 +110,10 @@ class GroupRecoveryMixin:
                         budget = self._GROUP_DONE_ATTEMPTS + int(prompt["watchdog_used"])
                         if prompt["clicks"] < budget and point is not None:
                             prompt["clicks"] += 1
-                            self._record_group_soak(prompt, "before", frame,
-                                                    {**details, "point": list(point)})
                             # Own input from capture through move/down/up. Recheck
                             # the prompt so a retired callback cannot press.
                             if self._group_prompt_may_act(prompt):
                                 self._click_abs(*point, "GROUP_DONE")
-                                prompt["awaiting_after"] = True
                                 bot_logger.log_info(
                                     f"GROUP_RECOVERY_DONE: context={prompt['context']} attempt={prompt['clicks']} point={point}"
                                 )

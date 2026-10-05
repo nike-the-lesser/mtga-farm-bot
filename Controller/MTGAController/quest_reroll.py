@@ -9,7 +9,6 @@ import json
 import os
 import threading
 import time
-from pathlib import Path
 
 import bot_logger
 import runtime_status
@@ -76,46 +75,6 @@ class QuestRerollMixin:
     def _reroll_log(self, outcome, detail=""):
         bot_logger.log_info(f"Quest reroll: {outcome}" + (f" ({detail})" if detail else "") + ".")
 
-    def _write_quest_reroll_debug_bundle(self, reason):
-        """TEMPORARY SOAK DIAGNOSTIC: remove after reroll readiness is verified live."""
-        stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
-        debug_dir = Path(bot_logger.ensure_debug_dir(f"quest-reroll-{stamp}"))
-        payload = {
-            "reason": reason,
-            "account": getattr(self, "_current_account_screen_name", None),
-            "state": str(self._get_state_from_log()),
-            "arena_region": getattr(self, "_arena_region", None),
-            "last_good_arena_region": getattr(self, "_last_good_arena_region", None),
-            "quest_reroll_pending": getattr(self, "_quest_reroll_pending", None),
-            "quest_reroll_floor": getattr(self, "_quest_reroll_floor", None),
-            "quest_reroll_data_floor": getattr(self, "_quest_reroll_data_floor", None),
-            "quest_reroll_dialog_open": getattr(self, "_quest_reroll_dialog_open", None),
-        }
-        try:
-            with (debug_dir / "quest_reroll_state.json").open("w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2)
-        except Exception:
-            pass
-        try:
-            tail = self._state_tracker.get_tail(180)
-            if not tail:
-                tail = self._read_log_tail(self._log_path, max_bytes=150000)
-            with (debug_dir / "log_tail.txt").open("w", encoding="utf-8") as handle:
-                handle.write(tail or "")
-        except Exception:
-            pass
-        try:
-            self._vision.begin_tick()
-            full = self._vision.capture(None)
-            self._vision.save_image(full, str(debug_dir / "full_screen.jpg"))
-            arena = getattr(self, "_arena_region", None)
-            if arena:
-                image = self._vision.capture(arena)
-                self._vision.save_image(image, str(debug_dir / "arena_region.png"))
-        except Exception:
-            pass
-        bot_logger.log_error(f"Quest reroll debug bundle saved: {debug_dir}")
-
     def _reroll_can_act(self):
         return (not self._stop_requested
                 and self._get_state_from_log() not in (BotState.IN_GAME, BotState.FIND_MATCH))
@@ -171,7 +130,6 @@ class QuestRerollMixin:
                 before = self._freshen_quest_reroll_snapshot()
             if before is None:
                 self._reroll_log("stale data", "no fresh startup/login quest response")
-                self._write_quest_reroll_debug_bundle("no_fresh_quest_response")
                 # No click was sent. A later Home landing can still obtain the
                 # authoritative response, so do not consume the one-shot.
                 self._quest_reroll_pending = True
@@ -190,7 +148,6 @@ class QuestRerollMixin:
                 # No dialog-opening click was sent. A black login-transition
                 # frame must not consume this account's one allowed reroll.
                 self._quest_reroll_pending = True
-                self._write_quest_reroll_debug_bundle("home_not_verified")
                 return False
             # Re-read after navigation in case the user changed quests meanwhile.
             before = self._extract_latest_quest_snapshot(min_offset=self._quest_reroll_floor)

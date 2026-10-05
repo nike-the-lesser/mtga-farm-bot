@@ -48,8 +48,6 @@ Quest reroll searches for the 500 Gold label in one continuous daily-quest area 
 
 Scry and Surveil keep normal gameplay paused until their central overlay is confirmed closed in two settled observations. Done is located again for each of up to three attempts, with input ownership held across recognition and the press. Surveil's fixed-position fallback requires its visible heading. Missing captures never count as completion. Recovery requires successful window focusing on Windows; Linux and macOS verify the visible overlay without requiring the Windows focus helper. The stall watchdog identifies the pending prompt and allows one final recovery attempt with a five-second grace period before conceding; recovery attempts do not reset the original stall age.
 
-**Temporary Scry/Surveil soak capture:** launch the UI from PowerShell with `$env:MTGA_GROUP_RECOVERY_SOAK = '1'` followed by `.\.venv\Scripts\python.exe ui.py`, then start the bot as usual. This saves before/after Arena frames, search regions, matching scores, intended coordinates and closure results under `runtime/debug/group-soak-*`. Extra capture output is disabled by default. After the soak, close that UI and run `Remove-Item Env:MTGA_GROUP_RECOVERY_SOAK` before restarting normally. Remove the temporary recorder after live verification; keep the recovery and regression tests.
-
 ## Quick Start
 
 Each platform has its own launcher script — named after the platform — that creates a virtual environment, installs dependencies, and starts the UI:
@@ -363,7 +361,7 @@ The bot maximizes mana usage each turn:
 - A creature target is clicked again only when a newer Arena target update confirms that no target was selected. A delayed or missing acknowledgement alone does not trigger another click, which could otherwise unselect the target.
 - Once required targets are selected, a failed Submit search retries up to three total attempts for the same prompt. Retries stop when the prompt changes, the match ends, or the bot stops; a successful Submit click is not repeated by this recovery.
 - Fiery Annihilation selects its required creature first, then tries one bounded scan for an opponent-controlled Equipment offered by Arena. If the Equipment cannot be selected, it uses **Submit 0** to skip that optional target. Target recovery also checks for Submit 0 when existing retries or submission attempts fail, provided every required target group is satisfied; it does not wait for the stall-concede deadline. Both own-player and opponent-player targets are checked against Arena's legal choices. Submission clicks must be followed by prompt advancement rather than being treated as proof of success.
-- Submit 0 uses a dedicated color template at **0.85 confidence**, with no Okay or coordinate fallback. **Temporary soak diagnostics (remove after live verification)** save labelled before/after screenshots and target-group state in `runtime/debug/optional-target-soak-*` for Equipment selection and zero submission; the audit index includes their log events and bundle paths.
+- Submit 0 uses a dedicated color template at **0.85 confidence**, with no Okay or coordinate fallback. Ordinary logs record Equipment scan attempts and Submit 0 attempts, failures, and acknowledged prompt advancement; the audit index includes these events.
 - After a two-click cast leaves the card, game state, and cast action unchanged, the bot waits for a known screen blocker to clear, then asks the AI for a fresh decision. This poll stops if the match or game state changes. On a clear screen, the bot checks that the same decision is still active and sends a guarded Escape. If that opens Options, a second Escape closes it. Only a completed Escape permits one fresh cast decision; busy input or lost focus before Escape leaves that retry available. If the follow-up also has no effect, it promptly asks for another decision; if the AI still chooses that card, the bot passes priority without a third click. Failed attempts save screenshots and state under `runtime/debug/`; `tools/analyze_cast_recovery.py` summarizes recovery outcomes from the log
 - Ties between otherwise equal casting plans favor lifegain-payoff creatures, so decks built around gaining life develop toward their game plan sooner
 - Removal only ever targets creatures still on the battlefield and never redirects a harmful spell at your own board when no valid enemy target exists
@@ -553,16 +551,14 @@ Two things this was *not*, both of which cost a round of investigation:
 
 Diagnosing this class of failure: check `Initialize engine version` at the top of `Player.log` before blaming bot code, and count `"objectId"` occurrences in it — a session with none of them is an input problem, not a scan problem.
 
-### Overnight soak diagnostics (2026-09)
+### Session diagnostics
 
-The session watchdog records `stall_concede`, `target_scan_timeout`,
-`target_click_missed`, `quest_no_fresh_data`, `quest_tile_missed`,
-`quest_reroll_failed`, `combat_recovery_failed`, `submit_failed`,
+The session watchdog records `combat_recovery_failed`, `submit_failed`,
 `pay_costs_unresolved`, `chooser_unconfirmed`, and `unsupported_cast` in
 `runtime/analysis/alerts.log` and per-match records. Recovery attempts and
 individual image-search misses are kept in history but are not counted as
 failures unless recovery is exhausted or no submit control is recognized.
-After an overnight run, inspect those alerts, the matching lines in
+After a session, inspect those alerts, the matching lines in
 `runtime/analysis/history.log`, and any
 `runtime/debug/hand-select-*` bundle with reason
 `opponent_battlefield_select_failed`. A stall concede line includes the local
@@ -570,8 +566,10 @@ seat, both priority fields, phase, step, and prompt. The target timeout line
 includes the cursor position and number of hover events seen before stopping.
 
 Unsupported casts are counted once per card name per match even if the decision
-loop considers the same card repeatedly. The alert signatures remain useful for
-future soak runs; keep the regression tests for the confirmed fixes.
+loop considers the same card repeatedly. Stall concessions, target scans, and
+quest reroll outcomes remain available in ordinary history logs. Temporary soak
+recorders and their dedicated tests have been removed; regression tests for the
+recovery behavior remain.
 
 ## See also on
 
