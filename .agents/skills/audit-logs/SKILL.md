@@ -47,13 +47,9 @@ concede rate is preserved after log rotation when the denominator is unchanged.
 Historical start/end timestamps fall back to first/last recorded match times.
 Do not substitute screenshot completion outcomes for confirmed concede evidence.
 
-While the temporary optional-target soak is present, inspect the summarizer's
-`optional_target_recovery` events and their `optional-target-soak-*` bundles.
-Compare Equipment selection counts and before/after screenshots, and check that
-Submit 0 clicked the intended button after required targets were satisfied.
+Inspect the summarizer's `optional_target_recovery` events from ordinary logs.
 Report attempts separately from acknowledged prompt advancement; neither proves
-that the Equipment was exiled or that the spell resolved. Missing soak bundles
-must not prevent an audit of ordinary logs and match records.
+that the Equipment was exiled or that the spell resolved.
 
 ### Permanent concede incidents
 

@@ -439,11 +439,15 @@ def gold_summary(events: list[dict], status: dict, current: bool, configured: se
     if not current:
         return {"available": False, "reason": "Historical session has no persisted start time or final Gold snapshot; log-derived totals may double-count aliases"}
     by_account = {key: value for key, value in sorted(farmed.items()) if value}
-    if current:
-        for alias, raw_value in status.get("gold_farmed", {}).items():
+    if isinstance(status.get("gold_farmed"), dict):
+        for alias, raw_value in status["gold_farmed"].items():
             key = canonical(str(alias), configured)
             if key in configured:
-                by_account.setdefault(key, int(raw_value or 0))
+                try:
+                    value = int(raw_value)
+                except (TypeError, ValueError):
+                    continue
+                by_account.setdefault(key, value)
     late = []
     for key, at in baselines.items():
         if key not in by_account:

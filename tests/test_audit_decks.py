@@ -72,10 +72,12 @@ class AuditDeckTests(unittest.TestCase):
                       (2, "[INFO] Starter: deck UB submitted; event page ready to queue."),
                       (21, "[INFO] Switching account to 'Bob#2'"),
                       (22, "[INFO] Switching account to 'Alice#1'"),
-                      (41, "=== MTGA Bot Session Started ==="),
-                      (42, "[INFO] Gold baseline for 'Alice#1': 100")])
-        matches = self.decks([self.record(1, 10), self.record(2, 30), self.record(3, 50)])
-        self.assertEqual([m["deck"] for m in matches], ["UB", None, None])
+                      (35, "[INFO] Starter: deck WB submitted; event page ready to queue."),
+                      (61, "=== MTGA Bot Session Started ==="),
+                      (62, "[INFO] Gold baseline for 'Alice#1': 100")])
+        matches = self.decks([self.record(1, 10), self.record(2, 25),
+                             self.record(3, 40), self.record(4, 70)])
+        self.assertEqual([m["deck"] for m in matches], ["UB", None, "WB", None])
 
     def test_historic_visible_memory_and_unnamed_fallback(self):
         self.history([(1, "[INFO] Gold baseline for 'Alice#1': 100"),

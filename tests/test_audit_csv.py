@@ -24,6 +24,26 @@ def summary(session="session-1", complete=True):
 
 
 class AuditHistoryTests(unittest.TestCase):
+    def test_invalid_gold_values_are_skipped_without_losing_valid_balances(self):
+        for invalid in ("invalid", None, [], {}):
+            with self.subTest(invalid=invalid):
+                result = audit.gold_summary(
+                    [], {"gold_farmed": {"Alice#1": invalid, "Bob#2": "150", "Carol#3": 0}},
+                    True, {"Alice#1", "Bob#2", "Carol#3"}, 1000, 4600, [])
+                self.assertEqual(result["by_account"], {"Bob#2": 150, "Carol#3": 0})
+                self.assertEqual(result["total"], 150)
+
+    def test_invalid_gold_mapping_preserves_history_totals(self):
+        events = [
+            {"text": "Gold baseline for 'Alice#1': 100", "at": 1000, "path": "history.log", "line": 1},
+            {"text": "Gold farmed (real): 'Alice#1' balance=250 farmed=150",
+             "at": 4600, "path": "history.log", "line": 2},
+        ]
+        result = audit.gold_summary(
+            events, {"gold_farmed": []}, True, {"Alice#1"}, 1000, 4600, [])
+        self.assertEqual(result["source"], "history")
+        self.assertEqual(result["by_account"], {"Alice#1": 150})
+
     def test_optional_target_history_remains_available_without_capture_bundles(self):
         lines = [
             "[2026-10-01 12:00:00.000] [INFO] FIERY_EQUIPMENT_ATTEMPT: target=287 found=True",

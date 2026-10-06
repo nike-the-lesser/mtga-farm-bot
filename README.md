@@ -571,10 +571,6 @@ quest reroll outcomes remain available in ordinary history logs. Temporary soak
 recorders and their dedicated tests have been removed; regression tests for the
 recovery behavior remain.
 
-## See also on
-
-[elitepvpers](https://www.elitepvpers.com/)
-
 ### Concede screenshots
 
 Bot-triggered stall and inactivity-timer concedes automatically create an incident
@@ -584,7 +580,7 @@ IDs, attempt and capture status, and final sequence outcome. The newest 30
 incidents are retained independently of other debug bundles.
 
 Images contain only the verified Arena client area, with solid masks over both
-player-name areas. They fit within 1280?720, preserve aspect ratio, and use JPEG
+player-name areas. They fit within 1280×720, preserve aspect ratio, and use JPEG
 quality 80. No original desktop image, player names or raw log excerpts are saved
 in these bundles. Masking supports the normal 16:9 in-match layout; arbitrary
 overlays and other diagnostic files are outside this feature's masking scope.
@@ -615,3 +611,8 @@ unconfirmed deck choices without supporting snapshots are `unknown`.
 Account switches and bot restarts clear carried selections. Repeat audits retain
 previously established deck evidence after log rotation when the game is unchanged.
 Use `--matches-csv <path>` for another destination; `--no-csv` disables both CSVs.
+Invalid saved Gold values are skipped so they do not prevent the audit report.
+
+## See also on
+
+[elitepvpers](https://www.elitepvpers.com/)
