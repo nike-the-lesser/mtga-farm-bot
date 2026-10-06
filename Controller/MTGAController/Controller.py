@@ -6863,19 +6863,9 @@ class Controller(GroupRecoveryMixin, PopupRecoveryMixin, QuestRerollMixin, Contr
         try:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             debug_dir = Path(bot_logger.ensure_debug_dir(f"cast-ack-failure-{stamp}"))
-            # Images are intentionally retained in memory until classification,
-            # but never embedded in JSON telemetry/bundles.
+            # Frames remain in memory for recovery checks; diagnostics are text-only.
             serializable = dict(payload)
             attempt = dict(serializable.get("attempt") or {})
-            for key, name in (("pre_click_image", "arena_pre_click.png"),
-                              ("post_wait_image", "arena_post_wait.png"),
-                              ("delayed_image", "arena_delayed.png")):
-                image = attempt.get(key)
-                if image is not None and self._vision is not None:
-                    try:
-                        self._vision.save_image(image, str(debug_dir / name))
-                    except Exception:
-                        pass
             for key in ("pre_click_image", "post_wait_image", "delayed_image"):
                 attempt.pop(key, None)
             serializable["attempt"] = attempt
@@ -6886,13 +6876,6 @@ class Controller(GroupRecoveryMixin, PopupRecoveryMixin, QuestRerollMixin, Contr
                 tail = self._read_log_tail(self._log_path, max_bytes=300000)
             with (debug_dir / "player_log_tail.txt").open("w", encoding="utf-8") as handle:
                 handle.write(tail or "")
-            if self._vision is not None:
-                self._vision.begin_tick()
-                full = self._vision.capture(None)
-                self._vision.save_image(full, str(debug_dir / "full_screen.jpg"))
-                if self._arena_region is not None:
-                    arena = self._vision.capture(self._arena_region)
-                    self._vision.save_image(arena, str(debug_dir / "arena_region.png"))
             bot_logger.log_error(f"CAST_ACK_BUNDLE: {debug_dir}")
         except Exception as exc:
             bot_logger.log_error(f"CAST_ACK_BUNDLE_FAILED: {exc}")
@@ -7060,9 +7043,7 @@ class Controller(GroupRecoveryMixin, PopupRecoveryMixin, QuestRerollMixin, Contr
             self.__schedule_decision_recovery(0.2, "cast_escape_retry_exhausted")
             return
 
-        before = self.__capture_cast_blocker_frame()
-        if before is not None:
-            self.__write_cast_escape_image(attempt, "before_escape", before)
+        self.__write_cast_escape_bundle(attempt, "before_escape")
         self.__cast_ack_event("cast_escape_recovery", attempt_id=attempt_id,
                               card_id=card_id, phase="before_escape", state=baseline)
         transaction = getattr(self.input, "input_transaction", None)
@@ -7091,9 +7072,7 @@ class Controller(GroupRecoveryMixin, PopupRecoveryMixin, QuestRerollMixin, Contr
                 self.input.tap_escape()
                 escape_sent = True
                 time.sleep(0.4)
-                after = self.__capture_cast_blocker_frame()
-                if after is not None:
-                    self.__write_cast_escape_image(attempt, "after_escape", after)
+                self.__write_cast_escape_bundle(attempt, "after_escape")
                 menu_open = self._options_overlay_visible()
                 if menu_open:
                     second_foreground = _describe_foreground_window()
@@ -7136,15 +7115,13 @@ class Controller(GroupRecoveryMixin, PopupRecoveryMixin, QuestRerollMixin, Contr
                         and self.__read_game_state_id() == baseline.get("game_state_id")):
                     self.__schedule_decision_recovery(0.2, "cast_escape_deferred")
 
-    def __write_cast_escape_image(self, attempt: dict, name: str, image) -> None:
+    def __write_cast_escape_bundle(self, attempt: dict, phase: str) -> None:
         try:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             debug_dir = Path(bot_logger.ensure_debug_dir(f"cast-escape-{stamp}"))
-            if self._vision is not None:
-                self._vision.save_image(image, str(debug_dir / f"{name}.png"))
             with (debug_dir / "recovery.json").open("w", encoding="utf-8") as handle:
                 json.dump({"attempt_id": attempt.get("attempt_id"), "card_id": attempt.get("card_id"),
-                           "image": name}, handle, indent=2)
+                           "phase": phase}, handle, indent=2)
         except Exception:
             pass
 
@@ -7354,7 +7331,6 @@ class Controller(GroupRecoveryMixin, PopupRecoveryMixin, QuestRerollMixin, Contr
         try:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             debug_dir = Path(bot_logger.ensure_debug_dir(f"cast-blocked-{stamp}"))
-            self._vision.save_image(frame, str(debug_dir / "arena.png"))
             with (debug_dir / "blocker.json").open("w", encoding="utf-8") as handle:
                 json.dump({
                     "blocker": blocker,
